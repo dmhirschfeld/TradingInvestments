@@ -1,0 +1,774 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * gsd-t-graph-index.cjs
+ *
+ * M94 D3-T2 — build_index + store write + per-file parse_and_put surface.
+ *
+ * Exposes:
+ *   build_index(repoRoot, { dbPath?, onProgress? })
+ *     Full-repo tree-sitter floor index → SQLite store via streaming writes.
+ *     The indexer MUST stream — never load the whole graph into RAM
+ *     (see K1 OOM finding in .gsd-t/spikes/k1-store-bakeoff-results.md).
+ *
+ *   parse_and_put(absPath, relPath, { db, scip? })
+ *     Per-file re-index surface that D4 (freshness) and D5 (query-cli re-index)
+ *     call. Returns { entities, edges, tier, contentHash }.
+ *     [RULE] reindex-tier-never-silently-downgraded: caller must pass the scip
+ *     upgrader (or null); this function is deterministic — it does not decide
+ *     the tier policy, it calls the tier labeller and records what it returns.
+ *
+ *   openStore(dbPath)   — open / create the SQLite graph store (better-sqlite3)
+ *   closeStore(db)      — close it
+ *   putRecord(db, rec)  — write a single file record (streaming-safe)
+ *   getRecord(db, file) — read a single file record
+ *   buildSchema(db)     — idempotent schema creation (called by openStore)
+ *
+ * Store: SQLite (better-sqlite3), WAL mode, streaming inserts per K1 invariant.
+ * Schema per graph-store-schema-contract.md §Record shape:
+ *   nodes table: (id TEXT PK, kind TEXT, tier TEXT, content_hash TEXT, file TEXT, name TEXT, func_id TEXT)
+ *   edges table: (kind TEXT, src TEXT, dst TEXT, partial INTEGER)
+ *   files table: (file TEXT PK, content_hash TEXT, tier TEXT, indexed_at TEXT)
+ *
+ * [RULE] accuracy-tier-labeled-never-silently-wrong
+ * [RULE] rust-cross-crate-flagged-partial
+ * [RULE] who-calls-function-identity-disambiguated (via edge-extract)
+ * [RULE] wave1-hard-gate-blocks-build (gate assumed cleared — K1=PICK/SQLite, K2=PASS)
+ *
+ * CLI usage:
+ *   node bin/gsd-t-graph-index.cjs build [--repo <path>] [--db <path>]
+ *   Emits JSON envelope on stdout, ANSI on stderr, exit 0=ok / 1=error.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const os = require('os');
+
+// ─── M99 D1: Single store resolver ───────────────────────────────────────────
+// All graph store path derivations go through the resolver.
+// [RULE] one-resolver-only
+const _resolver = require('./gsd-t-graph-store-resolver.cjs');
+
+// ── ANSI helpers ─────────────────────────────────────────────────────────────
+
+const C = {
+  reset: '\x1b[0m',
+  green: '\x1b[32m',
+  red: '\x1b[31m',
+  yellow: '\x1b[33m',
+  cyan: '\x1b[36m',
+  bold: '\x1b[1m',
+  dim: '\x1b[2m',
+};
+function log(msg) { process.stderr.write(msg + '\n'); }
+function info(msg)  { log(`${C.cyan}[IDX]${C.reset} ${msg}`); }
+function good(msg)  { log(`${C.green}[IDX OK]${C.reset} ${msg}`); }
+function warn(msg)  { log(`${C.yellow}[IDX WARN]${C.reset} ${msg}`); }
+function errLog(msg){ log(`${C.red}[IDX ERR]${C.reset} ${msg}`); }
+
+// ── Source-file extensions + skip dirs (matches D2 / K2 probe) ───────────────
+
+// ── Import path shortcuts (tsconfig `paths`) ────────────────────────────────
+//
+// A project writes `import x from "@/lib/foo"` and declares what `@/` means in
+// tsconfig: `"@/*": ["./src/*"]`. Stored raw, that target resolves to nothing —
+// the graph records an edge pointing at a string no file matches.
+//
+// Measured on HiloAviation: 5,738 of 23,263 import edges (25%) pointed at an
+// unexpanded shortcut. Ask "does anything import this file?" and a quarter of
+// the real answers are missing, so live code looks unreferenced. A reachability
+// rule built on that would have called 1,919 files of a working app dead.
+//
+// Read once per index build, applied to every import target before it is stored.
+// A project with no tsconfig, or none with paths, simply has nothing to expand.
+function loadPathAliases(projectDir) {
+  for (const name of ['tsconfig.json', 'jsconfig.json']) {
+    const file = path.join(projectDir, name);
+    if (!fs.existsSync(file)) continue;
+
+    let raw;
+    try {
+      raw = fs.readFileSync(file, 'utf8');
+    } catch (e) {
+      // Present but unreadable is a real problem, not an absent config: every
+      // shortcut in the project would silently go unresolved.
+      warn(`${name} could not be read (${e.message}) — import shortcuts will NOT be expanded`);
+      return null;
+    }
+
+    // These files routinely carry comments and trailing commas, which JSON does
+    // not allow. Strip them rather than fail — but never strip inside a string,
+    // or a URL like "https://..." loses everything after the //.
+    const stripped = raw
+      .replace(/("(?:[^"\\]|\\.)*")|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, (m, str) => str || '')
+      .replace(/,(\s*[}\]])/g, '$1');
+
+    let cfg;
+    try {
+      cfg = JSON.parse(stripped);
+    } catch (e) {
+      warn(`${name} is not parseable (${e.message}) — import shortcuts will NOT be expanded`);
+      return null;
+    }
+
+    const opts  = (cfg && cfg.compilerOptions) || {};
+    const paths = opts.paths;
+    if (!paths || typeof paths !== 'object') continue;
+
+    const base = opts.baseUrl ? path.join(projectDir, opts.baseUrl) : projectDir;
+    const rules = [];
+    for (const [pattern, targets] of Object.entries(paths)) {
+      if (!Array.isArray(targets) || targets.length === 0) continue;
+      rules.push({
+        prefix: pattern.replace(/\*$/, ''),          // "@/*"      -> "@/"
+        target: String(targets[0]).replace(/\*$/, ''), // "./src/*" -> "./src/"
+        wildcard: pattern.endsWith('*'),
+        base,
+      });
+    }
+    if (rules.length) {
+      info(`import shortcuts: ${rules.length} rule(s) from ${name} (${rules.map((r) => r.prefix + '*').join(', ')})`);
+      return rules;
+    }
+  }
+  return null;
+}
+
+// Turn one import target into a project-relative path when a rule matches it.
+// Returns the original string untouched when nothing matches — a package import
+// like "react" is not a shortcut and must stay exactly as written.
+function expandAlias(spec, rules, projectDir) {
+  if (!rules || !spec || typeof spec !== 'string') return spec;
+  for (const r of rules) {
+    if (!r.wildcard) {
+      if (spec !== r.prefix) continue;
+    } else if (!spec.startsWith(r.prefix)) continue;
+
+    const rest = r.wildcard ? spec.slice(r.prefix.length) : '';
+    const abs = path.resolve(r.base, r.target + rest);
+    return path.relative(projectDir, abs);
+  }
+  return spec;
+}
+
+const PARSED_EXTS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py']);
+const SKIP_DIRS = new Set([
+  'node_modules', '.next', 'dist', 'build', '.git',
+  '.cache', '__pycache__', 'coverage', '.nyc_output',
+  'out', '.turbo',
+  // M96 follow-up: vendored / generated trees that aren't project source and
+  // explode the file count (bee-poc had 18K files from .venv + iOS build assets,
+  // hanging scip-typescript at 8.5GB). Exclude language vendor/build dirs.
+  '.venv', 'venv', 'env', '.dart_tool', 'Pods', 'vendor', '.gradle',
+  '.idea', '.vscode', 'tmp', '.tmp', 'site-packages',
+]);
+
+// Build-output dirs often carry a suffix (dist-local, dist-test, build-ios,
+// out-prod). Prefix-match these so generated/minified bundles never pollute the
+// graph (binvoice indexed dist-local/dist-test → duplicate symbols in who-calls).
+const SKIP_DIR_PREFIXES = ['dist', 'build', 'out'];
+
+function shouldSkipDir(name) {
+  if (SKIP_DIRS.has(name)) return true;
+  for (const pre of SKIP_DIR_PREFIXES) {
+    // exact 'dist' is already in SKIP_DIRS; match 'dist-*'/'dist.*' variants.
+    if (name.length > pre.length && name.startsWith(pre) &&
+        (name[pre.length] === '-' || name[pre.length] === '.' || name[pre.length] === '_')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ── Content hash ──────────────────────────────────────────────────────────────
+
+/**
+ * [RULE] freshness-content-hash-not-git-sha: dirty-detection hashes file CONTENT.
+ */
+function contentHash(absPath) {
+  const data = fs.readFileSync(absPath);
+  return crypto.createHash('sha256').update(data).digest('hex').slice(0, 16);
+}
+
+// ── File enumeration ──────────────────────────────────────────────────────────
+
+function enumerateFiles(root) {
+  const results = [];
+  // Project exclude list (.gsd-t/graph-exclude.json) — ancillary trees such as
+  // design/Figma exports that are not the application. Throws on a malformed file.
+  const { isExcluded } = require('./gsd-t-graph-exclude.cjs').loadGraphExcludes(root);
+  function walk(dir) {
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+    catch { return; }
+    for (const e of entries) {
+      const absPath = path.join(dir, e.name);
+      const relPath = path.relative(root, absPath).split(path.sep).join('/');
+      if (e.isDirectory()) {
+        if (!shouldSkipDir(e.name) && !isExcluded(relPath)) walk(absPath);
+      } else if (e.isFile()) {
+        const ext = path.extname(e.name).toLowerCase();
+        if (PARSED_EXTS.has(ext) && !isExcluded(relPath)) {
+          results.push({ absPath, relPath, ext });
+        }
+      }
+    }
+  }
+  walk(root);
+  return results;
+}
+
+// ── SQLite store ──────────────────────────────────────────────────────────────
+
+/**
+ * Open (or create) the SQLite graph store.
+ * Returns a better-sqlite3 Database instance.
+ */
+function openStore(dbPath) {
+  const Database = require('./gsd-t-require-store.cjs').requireBetterSqlite();
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+  db.pragma('synchronous = NORMAL');
+  buildSchema(db);
+  return db;
+}
+
+function closeStore(db) {
+  if (db && db.open) db.close();
+}
+
+/**
+ * Idempotent schema creation.
+ *
+ * Schema per graph-store-schema-contract.md §Record shape.
+ *
+ * files:  one row per source file, carries the file-level tier + content_hash
+ * nodes:  entity nodes (funcId-keyed functions/classes/exports)
+ * edges:  import/require/call-site edges; partial flag for Rust cross-crate
+ */
+function buildSchema(db) {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS files (
+      file         TEXT PRIMARY KEY,
+      content_hash TEXT NOT NULL,
+      tier         TEXT NOT NULL,
+      indexed_at   TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS nodes (
+      id           TEXT PRIMARY KEY,
+      kind         TEXT NOT NULL,
+      tier         TEXT NOT NULL,
+      content_hash TEXT NOT NULL,
+      file         TEXT NOT NULL,
+      name         TEXT,
+      func_id      TEXT,
+      end_line     INTEGER,
+      meta         TEXT
+    );
+    CREATE TABLE IF NOT EXISTS edges (
+      kind    TEXT    NOT NULL,
+      src     TEXT    NOT NULL,
+      dst     TEXT    NOT NULL,
+      partial INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS edges_dst       ON edges(dst);
+    CREATE INDEX IF NOT EXISTS edges_src_kind  ON edges(src, kind);
+    CREATE INDEX IF NOT EXISTS edges_kind_dst  ON edges(kind, dst);
+    CREATE INDEX IF NOT EXISTS nodes_file      ON nodes(file);
+  `);
+  migrateEndLine(db);
+  migrateMeta(db);
+}
+
+/**
+ * Idempotent migration: add `nodes.meta` (JSON) — a table's SQL name + columns,
+ * an enum's values. NULL for functions/classes. [RULE] drizzle-table-entity-and-usage-edges
+ */
+function migrateMeta(db) {
+  const cols = db.prepare("PRAGMA table_info(nodes)").all();
+  if (!cols.some((c) => c.name === 'meta')) {
+    db.exec('ALTER TABLE nodes ADD COLUMN meta TEXT');
+  }
+}
+
+/**
+ * M98 — idempotent migration: add `nodes.end_line` to a pre-M98 graph that was
+ * built before the column existed. `CREATE TABLE IF NOT EXISTS` won't alter an
+ * existing table, so an older graph keeps its 7-column `nodes` until this runs.
+ * Safe to call on every open: checks PRAGMA first, ALTERs only when absent, never
+ * loses data. A NULL end_line is allowed (D2 re-indexes the file to populate it).
+ */
+function migrateEndLine(db) {
+  const cols = db.prepare("PRAGMA table_info(nodes)").all();
+  if (!cols.some((c) => c.name === 'end_line')) {
+    db.exec('ALTER TABLE nodes ADD COLUMN end_line INTEGER');
+  }
+}
+
+/**
+ * Write a single file record to the store (streaming-safe — called per-file).
+ *
+ * Deletes old nodes/edges for this file first, then inserts the new set.
+ * WAL mode ensures atomic visibility (no torn reads during write).
+ *
+ * @param {object} db        - better-sqlite3 Database
+ * @param {{ file, contentHash, entities, edges, tier }} rec
+ */
+/**
+ * Prepare (once) and cache the per-file write statements on the db handle.
+ * better-sqlite3 statement preparation is expensive; re-preparing all 6
+ * statements on EVERY file (putRecord is called per-file across thousands of
+ * files) was the dominant cost — a full Atos index took 61 min almost entirely
+ * here. Preparing once and reusing drops it to seconds. The cache is keyed on
+ * the db handle so a fresh db re-prepares correctly.
+ */
+function getWriteStmts(db) {
+  if (db.__m94WriteStmts) return db.__m94WriteStmts;
+  // A handle opened elsewhere (the freshness re-index opens the db without
+  // buildSchema) may point at an older graph — add the columns written below.
+  migrateEndLine(db);
+  migrateMeta(db);
+  const stmts = {
+    deleteNodes: db.prepare('DELETE FROM nodes WHERE file = ?'),
+    deleteEdgesSrc: db.prepare("DELETE FROM edges WHERE src = ? OR src LIKE ? OR src = ?"),
+    insFile: db.prepare('INSERT OR REPLACE INTO files (file, content_hash, tier, indexed_at) VALUES (?, ?, ?, ?)'),
+    insNode: db.prepare('INSERT OR REPLACE INTO nodes (id, kind, tier, content_hash, file, name, func_id, end_line, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'),
+    insEdge: db.prepare('INSERT INTO edges (kind, src, dst, partial) VALUES (?, ?, ?, ?)'),
+  };
+  // db.transaction() wrapper is also created once (it closes over the stmts).
+  stmts.doWrite = db.transaction((rec) => {
+    const { file, contentHash: hash, entities, edges, tier, now } = rec;
+    stmts.deleteNodes.run(file);
+    stmts.deleteEdgesSrc.run(file, `${file}#%`, file);
+    stmts.insFile.run(file, hash, tier, now);
+    for (const entity of entities) {
+      stmts.insNode.run(entity.id, entity.type || 'function', tier, hash, file, entity.name || null, entity.id, entity.endLine ?? null,
+        entity.meta === undefined ? null : JSON.stringify(entity.meta));
+    }
+    for (const edge of edges) {
+      stmts.insEdge.run(edge.kind, edge.src, edge.dst, edge.partial ? 1 : 0);
+    }
+  });
+  Object.defineProperty(db, '__m94WriteStmts', { value: stmts, enumerable: false });
+  return stmts;
+}
+
+function putRecord(db, rec) {
+  const { file, contentHash: hash, entities, edges, tier } = rec;
+  const now = new Date().toISOString();
+  // Prepared-statement bundle is created ONCE per db handle (see getWriteStmts).
+  getWriteStmts(db).doWrite({ file, contentHash: hash, entities, edges, tier, now });
+}
+
+/**
+ * Read a single file's record from the store.
+ * Returns { file, contentHash, tier, indexedAt } or null if not found.
+ */
+function getRecord(db, file) {
+  const row = db.prepare('SELECT * FROM files WHERE file = ?').get(file);
+  if (!row) return null;
+  return {
+    file: row.file,
+    contentHash: row.content_hash,
+    tier: row.tier,
+    indexedAt: row.indexed_at,
+  };
+}
+
+// ── Per-file parse + put (the surface D4/D5 call) ────────────────────────────
+
+/**
+ * Parse a single file and write it to the store.
+ *
+ * This is the per-file re-index surface that D4 (freshness) and D5 (query-cli)
+ * call when a file is stale or needs inline re-indexing.
+ *
+ * [RULE] reindex-tier-never-silently-downgraded: the scip upgrader (or null)
+ * is passed by the caller; this function is deterministic — it applies the
+ * tier policy that the upgrader declares and records it faithfully.
+ *
+ * @param {string} absPath         - absolute path to the file
+ * @param {string} relPath         - repo-relative POSIX path
+ * @param {{ db: Database, scip?: object, existingTier?: string }} options
+ * @returns {{ entities, edges, tier, contentHash }}
+ */
+function parse_and_put(absPath, relPath, options) {
+  const { db, scip = null, existingTier = null } = options || {};
+
+  const { extractEdges } = require('./gsd-t-graph-edge-extract.cjs');
+  const { tryScipUpgrade } = scip || {};
+
+  // Extract via tree-sitter floor
+  const { entities, edges, loc } = extractEdges(absPath, relPath);
+  const hash = contentHash(absPath);
+
+  let finalEntities = entities;
+  let finalEdges = edges;
+  let tier = 'tree-sitter-floor';
+
+  // Optional SCIP upgrade
+  // [RULE] reindex-tier-never-silently-downgraded: pass existingTier as prevTier so
+  // the upgrader can produce 'tree-sitter-floor-STALE-SCIP' instead of plain floor
+  // when a previously compiler-accurate file loses its SCIP indexer.
+  if (typeof tryScipUpgrade === 'function') {
+    const upgraded = tryScipUpgrade(absPath, relPath, entities, edges, {
+      prevTier: existingTier,
+      projectRoot: scip.projectRoot || require('path').dirname(absPath),
+      resolver: scip.resolver || null,
+    });
+    if (upgraded) {
+      // ALWAYS use the tier returned by the upgrader — it encodes the full
+      // tier-preservation logic including STALE-SCIP (even when upgraded=false)
+      tier = upgraded.tier;
+      finalEntities = upgraded.entities;
+      finalEdges = upgraded.edges;
+    }
+  } else if (existingTier === 'compiler-accurate' || existingTier === 'compiler-partial') {
+    // [RULE] reindex-tier-never-silently-downgraded — no SCIP context this call
+    // (e.g. a metadata-only re-index like M98's body end-line backfill). A file that
+    // WAS compiler-accurate must NOT silently drop to plain floor; label it STALE-SCIP
+    // so the tier reflects "previously accurate, not re-resolved" rather than a lie.
+    tier = 'tree-sitter-floor-STALE-SCIP';
+  } else if (existingTier === 'tree-sitter-floor-SCIP-MISSING') {
+    // Same principle: a file SCIP never indexed stays labelled as such until a
+    // full build (with SCIP) says otherwise. [RULE] scip-missing-file-detected-never-silent
+    tier = existingTier;
+  }
+
+  // Normalize edges to store schema (map from parser-floor shape to store shape)
+  const storeEdges = finalEdges.map(edge => {
+    if (edge.kind === 'import' || edge.kind === 'require') {
+      // Expand a path shortcut ("@/lib/foo") into a real project path before it
+      // is stored. Stored raw it points at a string no file matches, and every
+      // question about what-imports-what silently loses that edge.
+      const rawDst = edge.target || edge.dst;
+      return {
+        kind: 'IMPORT',
+        src: edge.source || edge.src,
+        dst: expandAlias(rawDst, (options && options.aliasRules) || null, (options && options.projectDir) || '.'),
+        partial: 0,
+      };
+    }
+    if (edge.kind === 'call-site') {
+      return {
+        kind: 'CALL',
+        src: edge.source || edge.src,
+        dst: edge.target || edge.dst,
+        partial: edge.partial ? 1 : 0,
+      };
+    }
+    // passthrough
+    return {
+      kind: edge.kind,
+      src: edge.source || edge.src,
+      dst: edge.target || edge.dst,
+      partial: edge.partial ? 1 : 0,
+    };
+  });
+
+  // Normalize entities to store schema
+  const storeEntities = finalEntities.map(e => ({
+    id: e.id,
+    type: e.type,
+    name: e.name,
+    file: relPath,
+    exported: e.exported,
+    parentClass: e.parentClass,
+    endLine: e.endLine ?? null,   // M98 — function end line for body-slice
+    ...(e.meta === undefined ? {} : { meta: e.meta }), // table / enum: SQL name, columns, values
+  }));
+
+  if (db) {
+    putRecord(db, {
+      file: relPath,
+      contentHash: hash,
+      entities: storeEntities,
+      edges: storeEdges,
+      tier,
+    });
+  }
+
+  return { entities: storeEntities, edges: storeEdges, tier, contentHash: hash, loc };
+}
+
+// ── build_index (full-repo) ───────────────────────────────────────────────────
+
+/**
+ * Full-repo index build.
+ *
+ * Streams per-file: enumerate → parse → store.put (never loads all in RAM).
+ * Calls the SCIP upgrader if present (per-language tier upgrade).
+ *
+ * @param {string} repoRoot       - absolute path to the repo root
+ * @param {{ dbPath?, scip?, onProgress? }} options
+ * @returns {{ fileCount, entityCount, edgeCount, tier: { floor, upgraded }, durationMs }}
+ */
+function build_index(repoRoot, options) {
+  const {
+    dbPath = _resolver.resolveStorePath(repoRoot), // [RULE] one-resolver-only
+    scip = null,
+    onProgress = null,
+  } = options || {};
+
+  // Ensure the parent directory exists
+  const dbDir = path.dirname(dbPath);
+  if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
+
+  const db = openStore(dbPath);
+  const files = enumerateFiles(repoRoot);
+
+  // M95: build the repo-level SCIP resolver ONCE (run scip-typescript over the
+  // whole repo, read index.scip, build the symbol→funcId resolution maps). Each
+  // file's parse_and_put then resolves its call edges against this shared map.
+  // If the caller passed a `scip` object explicitly (tests inject mocks), respect
+  // it; otherwise auto-build from the upgrader.
+  let scipCtx = scip;
+  if (!scipCtx) {
+    const upg = require('./gsd-t-graph-scip-upgrade.cjs');
+    const resolver = upg.buildScipResolver(repoRoot);
+    scipCtx = {
+      tryScipUpgrade: upg.tryScipUpgrade,
+      resolver: resolver.ok ? resolver : null,
+      projectRoot: repoRoot,
+    };
+    if (resolver.ok) {
+      info(`SCIP resolver active (${resolver.scipPath}) — call edges will be resolved compiler-accurate.`);
+    } else {
+      info(`SCIP resolver unavailable (${resolver.reason}) — tree-sitter floor (approximate). Install scip-typescript for compiler-accurate call edges.`);
+    }
+  }
+
+  // Read the project's import shortcuts ONCE for the whole build. Every import
+  // target is expanded through these before it is stored, so an edge points at a
+  // real path rather than at a string nothing matches.
+  const aliasRules = loadPathAliases(repoRoot);
+  if (!aliasRules) {
+    info('import shortcuts: none declared (no tsconfig/jsconfig paths) — import targets stored as written');
+  }
+
+  const t0 = Date.now();
+  let fileCount = 0;
+  let entityCount = 0;
+  let edgeCount = 0;
+  let tierFloor = 0;
+  let tierUpgraded = 0;
+  let tierPartial = 0; // [RULE] scip-tier-proportional
+  let callEdges = 0;
+  let callEdgesUnresolved = 0;
+  let errors = 0;
+  const skippedFiles = [];
+  const scipMissing = []; // files SCIP ran for but produced no document for
+  let tableCount = 0;
+  let enumCount = 0;
+  const tablesUnresolved = []; // [RULE] drizzle-table-shape-gap-named-never-skipped
+
+  // Stream: parse + put each file one at a time (never accumulate the full set)
+  for (const { absPath, relPath } of files) {
+    try {
+      const result = parse_and_put(absPath, relPath, { db, scip: scipCtx, aliasRules, projectDir: repoRoot });
+      fileCount++;
+      entityCount += result.entities.length;
+      edgeCount += result.edges.length;
+      if (result.tier === 'compiler-accurate') tierUpgraded++;
+      else if (result.tier === 'compiler-partial') tierPartial++;
+      else tierFloor++;
+      for (const e of result.edges) {
+        if (e.kind !== 'call-site' && e.kind !== 'CALL') continue;
+        callEdges++;
+        if (String(e.target || e.dst).startsWith('UNRESOLVED#')) callEdgesUnresolved++;
+      }
+      if (result.tier === 'tree-sitter-floor-SCIP-MISSING') scipMissing.push(relPath);
+      for (const ent of result.entities) {
+        if (ent.type === 'table') tableCount++;
+        if (ent.type === 'enum') enumCount++;
+        if (ent.meta && ent.meta.unresolved) tablesUnresolved.push({ file: relPath, name: ent.name, problems: ent.meta.unresolved });
+      }
+      if (typeof onProgress === 'function') {
+        onProgress({ file: relPath, tier: result.tier, fileCount, total: files.length });
+      }
+    } catch (err) {
+      errors++;
+      skippedFiles.push({ file: relPath, reason: err.message });
+      warn(`Failed to index ${relPath}: ${err.message}`);
+    }
+  }
+
+  // A full build leaves exactly the enumerated set: rows for a file that is gone
+  // or newly excluded (e.g. GSD-T's copied bin/ tools) are pruned, not kept.
+  // [RULE] status-counts-files-table
+  const enumerated = new Set(files.map((f) => f.relPath));
+  const stale = db.prepare('SELECT file FROM files').all().map((r) => r.file).filter((f) => !enumerated.has(f));
+  if (stale.length) {
+    const w = getWriteStmts(db);
+    const delFile = db.prepare('DELETE FROM files WHERE file = ?');
+    db.transaction(() => {
+      for (const f of stale) { w.deleteNodes.run(f); w.deleteEdgesSrc.run(f, `${f}#%`, f); delFile.run(f); }
+    })();
+    info(`Pruned ${stale.length} file(s) no longer in the project (deleted or excluded)`);
+  }
+
+  // Record the skipped set + parse-success-rate so a query whose edges live in a
+  // skipped file can return a coverage flag ('result may be incomplete — N files
+  // unparsed') instead of a bare empty set that reads as authoritative truth.
+  // A silently-missing edge is a WRONG answer (the no-wrong invariant).
+  const totalEnumerated = files.length;
+  const parseSuccessRate = totalEnumerated > 0 ? (totalEnumerated - errors) / totalEnumerated : 1;
+  const PARSE_RATE_FLOOR = 0.95;
+  const knownLimitation = parseSuccessRate < PARSE_RATE_FLOOR
+    ? `parse-success-rate ${(parseSuccessRate * 100).toFixed(1)}% is below the ${PARSE_RATE_FLOOR * 100}% floor — ${errors} of ${totalEnumerated} files unparsed; queries touching those files surface a coverage-incomplete flag`
+    : null;
+  // Persist the skipped set into the store so queries can consult it (best-effort;
+  // a meta table keyed by file).
+  try {
+    const meta = openStore(dbPath);
+    meta.exec('CREATE TABLE IF NOT EXISTS skipped_files (file TEXT PRIMARY KEY, reason TEXT)');
+    const insSkip = meta.prepare('INSERT OR REPLACE INTO skipped_files (file, reason) VALUES (?, ?)');
+    const tx = meta.transaction((rows) => { for (const r of rows) insSkip.run(r.file, r.reason); });
+    tx(skippedFiles);
+    closeStore(meta);
+  } catch { /* meta is best-effort; the result envelope still carries the set */ }
+
+  closeStore(db);
+
+  const durationMs = Date.now() - t0;
+
+  // R4-2 honesty: SCIP is an OPTIONAL accuracy upgrade. When no SCIP indexer was
+  // provided/available, EVERY file stays tree-sitter-floor (approximate edges) —
+  // that is correct (the graph never depends on SCIP to function), but it must be
+  // SURFACED LOUDLY, never a silent 0-upgrade that reads like full accuracy.
+  // SCIP is active when the resolver built successfully (auto-built or injected).
+  const scipActive = !!(scipCtx && scipCtx.resolver && scipCtx.resolver.ok);
+  let scipNotice = null;
+  if (!scipActive && tierUpgraded === 0) {
+    scipNotice =
+      'SCIP indexer not available — all edges are tree-sitter-floor (approximate, not compiler-accurate). ' +
+      'This is a working graph; for compiler-accurate TS/JS/Python edges, install a SCIP indexer ' +
+      '(e.g. scip-typescript) and re-index. The graph never requires SCIP to function.';
+    console.error(`\x1b[33m[IDX NOTICE]\x1b[0m ${scipNotice}`);
+  }
+
+  // A file the SCIP indexer skipped keeps every call target unresolved, so
+  // who-calls cannot see its callers. Loud, every build — not a fallback, a
+  // report. `gsd-t graph status` repeats it. [RULE] scip-missing-file-detected-never-silent
+  if (scipMissing.length) {
+    const shown = scipMissing.slice(0, 10).join(', ');
+    warn(`${scipMissing.length} file(s) not in the SCIP index — their call edges stay unresolved ` +
+      `(tier tree-sitter-floor-SCIP-MISSING): ${shown}${scipMissing.length > 10 ? ', …' : ''}`);
+  }
+
+  // A table whose declaration had a shape the extractor could not read (a
+  // computed name, a spread of columns, a non-literal reference) is still an
+  // entity — but its columns or FKs are incomplete. Named every build, loud.
+  if (tablesUnresolved.length) {
+    warn(`${tablesUnresolved.length} table/enum declaration(s) only partly read — columns or foreign keys incomplete:`);
+    for (const t of tablesUnresolved.slice(0, 20)) warn(`  ${t.file} ${t.name}: ${t.problems.join('; ')}`);
+    if (tablesUnresolved.length > 20) warn(`  … ${tablesUnresolved.length - 20} more`);
+  }
+
+  return {
+    fileCount,
+    tableCount,
+    enumCount,
+    tablesUnresolved,
+    entityCount,
+    edgeCount,
+    tier: { floor: tierFloor, upgraded: tierUpgraded, partial: tierPartial },
+    callEdges,
+    callEdgesUnresolved,
+    scipMissing,
+    scipAvailable: scipActive,
+    scipNotice,
+    errors,
+    skippedFiles,
+    parseSuccessRate,
+    knownLimitation,
+    durationMs,
+    dbPath,
+  };
+}
+
+// ── CLI entry point ───────────────────────────────────────────────────────────
+
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  const cmd = args[0] || 'build';
+
+  if (cmd !== 'build') {
+    errLog(`Unknown command: ${cmd}. Use: build`);
+    process.exit(1);
+  }
+
+  const repoIdx = args.indexOf('--repo');
+  const dbIdx = args.indexOf('--db');
+  const repoRoot = repoIdx !== -1 ? args[repoIdx + 1] : process.cwd();
+  const dbPath = dbIdx !== -1 ? args[dbIdx + 1] : _resolver.resolveStorePath(repoRoot); // [RULE] one-resolver-only
+
+  if (!fs.existsSync(repoRoot)) {
+    errLog(`Repo root not found: ${repoRoot}`);
+    process.exit(1);
+  }
+
+  info(`build_index — repo: ${repoRoot}`);
+  info(`Store: ${dbPath}`);
+
+  // Pass scip:null so build_index AUTO-BUILDS the repo-level SCIP resolver
+  // (runs scip-typescript once, reads index.scip, resolves call edges). Passing
+  // the raw upgrader MODULE here was the bug: build_index saw a truthy `scip`
+  // context with no `.resolver`, skipped auto-build, and stored 0 resolved edges
+  // on every CLI `gsd-t graph index` (M95/M96 fixtures passed because they called
+  // build_index({dbPath}) directly with scip:null). [RULE] cli-build-auto-resolves-scip
+  const result = build_index(repoRoot, {
+    dbPath,
+    onProgress: ({ file, tier, fileCount, total }) => {
+      if (fileCount % 100 === 0) {
+        info(`[${fileCount}/${total}] ${tier === 'compiler-accurate' ? C.green : C.dim}${file}${C.reset}`);
+      }
+    },
+  });
+
+  good(`Indexed ${result.fileCount} files, ${result.entityCount} entities, ${result.edgeCount} edges in ${result.durationMs}ms`);
+  good(`Tiers — floor: ${result.tier.floor}, compiler-accurate: ${result.tier.upgraded}, compiler-partial: ${result.tier.partial}`);
+  if (result.callEdges) {
+    info(`Call edges unresolved: ${result.callEdgesUnresolved} of ${result.callEdges} ` +
+      `(${(100 * result.callEdgesUnresolved / result.callEdges).toFixed(1)}% — library calls such as console.log never resolve)`);
+  }
+  good(`Database tables: ${result.tableCount}, enums: ${result.enumCount}`);
+  if (result.errors > 0) warn(`${result.errors} files had parse errors (skipped)`);
+
+  const envelope = {
+    ok: true,
+    cmd: 'build',
+    repoRoot,
+    dbPath: result.dbPath,
+    fileCount: result.fileCount,
+    entityCount: result.entityCount,
+    edgeCount: result.edgeCount,
+    tier: result.tier,
+    scipMissingCount: result.scipMissing.length,
+    tableCount: result.tableCount,
+    enumCount: result.enumCount,
+    tablesUnresolved: result.tablesUnresolved,
+    errors: result.errors,
+    durationMs: result.durationMs,
+  };
+  console.log(JSON.stringify(envelope, null, 2));
+  process.exit(0);
+}
+
+module.exports = {
+  build_index,
+  parse_and_put,
+  openStore,
+  closeStore,
+  buildSchema,
+  putRecord,
+  getRecord,
+  contentHash,
+  enumerateFiles,
+  PARSED_EXTS,
+  SKIP_DIRS,
+};

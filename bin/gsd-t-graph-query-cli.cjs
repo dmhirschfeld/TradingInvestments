@@ -1,0 +1,2124 @@
+#!/usr/bin/env node
+"use strict";
+
+/**
+ * gsd-t-graph-query-cli — M94 D5 (extended by D9)
+ *
+ * The DETERMINISTIC query CLI the model cannot route around — the no-stale-no-wrong KEYSTONE.
+ *
+ * Verbs (D5 — original):
+ *   gsd-t graph who-imports <file>             — file→file reverse import edges
+ *   gsd-t graph who-calls <file#function>      — function→function reverse call edges (funcId-keyed)
+ *   gsd-t graph body <file#function|symbol>    — (M98) a function's SOURCE sliced LIVE from disk + imports + class header + callers
+ *   gsd-t graph blast-radius <target>          — UNION of import-graph + call-graph reverse-reachable set (transitive)
+ *   gsd-t graph status                         — live queryable index state
+ *
+ * Verbs (D9 additions):
+ *   gsd-t graph cluster                        — tightly-coupled file groups (for /partition + /project)
+ *   gsd-t graph dead-code                      — nodes with no inbound edges (alias: orphan)
+ *   gsd-t graph orphan                         — alias for dead-code
+ *   gsd-t graph dangling                       — edges whose dst is a missing node (delete/rename residue)
+ *   gsd-t graph test-impl [--inverse]          — test→impl call coverage (--inverse = untested-impl)
+ *
+ * Verbs (database tables — Drizzle pgTable/mysqlTable/sqliteTable + pgEnum):
+ *   gsd-t graph who-uses <table> [--writes|--reads] — functions / methods / route handlers using a table
+ *   gsd-t graph table <table>                   — columns + foreign keys in both directions
+ *   (blast-radius <table> and body <table> also accept a table)
+ *
+ * Invariants (all verified by keystone tests):
+ *   [RULE] query-cli-never-greps       — NO directive-driven grep fallback in any code path
+ *   [RULE] parser-fail-disables-loud-never-silent — genuine parser/store failure → {ok:false, reason:'graph-unavailable'}
+ *   [RULE] stale-file-reindexed-before-answer  — D4 freshness check INLINE before answering
+ *   [RULE] who-calls-function-identity-disambiguated — bare name matching multiple funcIds → ambiguous-function
+ *   [RULE] blast-radius-unions-both-graphs     — UNION of import + call reverse-reachable, transitive closure
+ *   [RULE] graph-status-live                   — status returns a live queryable index (M20–M21 anti-goal fails)
+ *   [RULE] cluster-verb-deterministic-coupling — DETERMINISTIC coupling metric, not LLM judgment
+ *   [RULE] dead-code-verb-excludes-entrypoints-and-exports — exclusions declared in contract
+ *   [RULE] dangling-verb-surfaces-missing-dst  — edges whose dst is not in the node set
+ *   [RULE] orphan-tier-labeled-candidate-not-certainty — floor-tier orphans labeled CANDIDATE
+ *   [RULE] test-impl-verb-from-call-site-edges-no-new-type — derived from existing call-site edges
+ *   [RULE] test-impl-no-new-edge-type-needed   — confirmed: call-site edges already cover test→impl
+ *   [RULE] test-impl-never-presents-unresolved-as-coverage — UNRESOLVED# targets never in implFuncs
+ *   [RULE] query-surfaces-incompleteness-never-silent-empty — coverage field on who-imports/who-calls/blast-radius
+ *
+ * Dependencies (fail-loud if absent — never silently fall back):
+ *   bin/gsd-t-graph-freshness.cjs  — D4: freshness_check_on_query + compute_touched_files
+ *   bin/gsd-t-graph-index.cjs      — D3: parse_and_put (called by D4, not directly here)
+ *
+ * Zero external runtime deps for the installer. Sync file APIs. JSON envelope output.
+ *
+ * JSON envelope shapes:
+ *   { ok: true,  verb: "who-imports|who-calls|blast-radius|status", target: "...", results: [...], tier: "...", coverage: {...} }
+ *   { ok: true,  verb: "cluster", results: [{files:[...], couplingScore}], tier: "..." }
+ *   { ok: true,  verb: "dead-code", results: [{funcId, file, tier, candidateLabel}], tier: "..." }
+ *   { ok: true,  verb: "dangling", results: [{src, dst, kind}], tier: "..." }
+ *   { ok: true,  verb: "test-impl", results: [{testFunc, implFuncs:[...]}], tier: "..." }
+ *   { ok: false, reason: "graph-unavailable" }
+ *   { ok: false, reason: "ambiguous-function", verb: "who-calls", target: "foo", candidates: ["a.ts#foo","b.ts#foo"] }
+ *   { ok: false, reason: "unknown-target", verb: "...", target: "..." }
+ *
+ * CLI usage:
+ *   node bin/gsd-t-graph-query-cli.cjs who-imports src/foo.ts
+ *   node bin/gsd-t-graph-query-cli.cjs who-calls 'src/foo.ts#bar'
+ *   node bin/gsd-t-graph-query-cli.cjs blast-radius src/foo.ts
+ *   node bin/gsd-t-graph-query-cli.cjs status
+ *   node bin/gsd-t-graph-query-cli.cjs cluster
+ *   node bin/gsd-t-graph-query-cli.cjs dead-code
+ *   node bin/gsd-t-graph-query-cli.cjs orphan
+ *   node bin/gsd-t-graph-query-cli.cjs dangling
+ *   node bin/gsd-t-graph-query-cli.cjs test-impl
+ *   node bin/gsd-t-graph-query-cli.cjs test-impl --inverse
+ *
+ * Exit: 0 on success, 1 on graph-unavailable or error, 2 on ambiguous-function.
+ */
+
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+
+// ─── M99 D1: Single store resolver (routing ALL path derivations here) ────────
+// [RULE] one-resolver-only — no raw .gsd-t/graph.db literals outside this module
+const _resolver = require("./gsd-t-graph-store-resolver.cjs");
+
+// ─── ANSI colours ────────────────────────────────────────────────────────────
+const C = {
+  reset:  "\x1b[0m",
+  bold:   "\x1b[1m",
+  green:  "\x1b[32m",
+  yellow: "\x1b[33m",
+  red:    "\x1b[31m",
+  cyan:   "\x1b[36m",
+  dim:    "\x1b[2m",
+};
+
+function colorize(str, ...codes) {
+  return codes.join("") + str + C.reset;
+}
+
+// ─── Store location ───────────────────────────────────────────────────────────
+// ALL path resolution routes through the M99 D1 resolver module.
+// [RULE] one-resolver-only — no raw .gsd-t/graph.db literals in this file.
+//
+// Discovery order (per resolver contract):
+//   1. GSD_T_GRAPH_STORE env var override
+//   2. cwd-walk: .gsd-t/graphDB/graph.db (new layout post-M99)
+//   3. cwd-walk: .gsd-t/graph.db (legacy — triggers self-heal migration via migrateGraphStore)
+//   4. cwd-walk: .gsd-t/graph-index/ (JSONL baseline)
+
+function resolveStorePath() {
+  if (process.env.GSD_T_GRAPH_STORE) {
+    return process.env.GSD_T_GRAPH_STORE;
+  }
+  // Walk up from cwd to find the store.
+  // Check the NEW graphDB layout first; fall back to legacy for self-heal;
+  // then JSONL for the baseline store. This is THE primary discovery path —
+  // post-migration it MUST find graphDB/graph.db, not the legacy .gsd-t/graph.db.
+  // [RULE] discovery-loop-end-to-end (pre-mortem #1)
+  let dir = process.cwd();
+  for (let i = 0; i < 10; i++) {
+    // New layout: .gsd-t/graphDB/graph.db (M99+)
+    const newDbPath = _resolver.resolveStorePath(dir);
+    if (fs.existsSync(newDbPath)) return newDbPath;
+    // Legacy layout: check via resolver's legacy path helper (no raw literals here)
+    const legacyDbPath = _resolver.resolveLegacyStorePath(dir); // [RULE] one-resolver-only
+    if (fs.existsSync(legacyDbPath)) {
+      // Self-heal: migrate to graphDB/ on first touch (T2 wire-in)
+      try { _resolver.migrateGraphStore(dir); } catch (_e) { /* fail-open */ }
+      // After migration, new path should exist; fall through to next iteration
+      if (fs.existsSync(newDbPath)) return newDbPath;
+      // Migration didn't complete (or skipped) — return legacy for backward compat
+      return legacyDbPath;
+    }
+    // JSONL baseline (pre-SQLite projects)
+    const jsonlDir = path.join(dir, ".gsd-t", "graph-index");
+    if (fs.existsSync(jsonlDir)) return jsonlDir;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+// ─── In-memory store interface ────────────────────────────────────────────────
+// Reads the on-disk JSONL/SQLite store (whichever D3 wrote) and builds
+// in-memory index structures optimised for the query verbs.
+//
+// Store format (per graph-store-schema-contract.md):
+//   Each record: { file, content_hash, entities: FuncEntity[], edges: Edge[], tier }
+//   Edge: { kind: "IMPORT"|"CALL", src, dst }
+//   FuncEntity: { funcId, name, kind, file, tier }
+//
+// D5 supports the JSONL flat-file store (the K1 baseline that PASSED).
+// If SQLite becomes the picked store, D3 owns that path; D5 reads via the
+// same record shape declared in graph-store-schema-contract.md.
+
+/**
+ * @typedef {{ importGraph: Map<string,Set<string>>, callGraph: Map<string,Set<string>>,
+ *             funcEntities: Map<string,{name:string,file:string,tier:string,endLine:?number}>,
+ *             allFiles: Set<string>, tier: string,
+ *             skippedFiles: Set<string> }} IndexStructure
+ *
+ * skippedFiles: files that failed to parse (D3-T6 skipped set). Used by T5 to
+ * compute coverage.complete:false when a query's contributors include unparsed files.
+ */
+
+// ─── Test-path patterns for test→impl verb (D9-T3) ───────────────────────────
+// Declared here (configurable via GSD_T_TEST_PATTERNS env var) so they are
+// visible in the contract and overridable for different project layouts.
+// Default patterns: *.test.*, *.spec.*, e2e/** directories.
+// [RULE] test-impl-verb-from-call-site-edges-no-new-type
+
+const DEFAULT_TEST_PATTERNS = [
+  /\.test\.[^.]+$/,     // *.test.ts, *.test.js, etc.
+  /\.spec\.[^.]+$/,     // *.spec.ts, *.spec.js, etc.
+  /(?:^|\/)e2e\//,      // e2e/** directory prefix
+  /(?:^|\/)__tests__\//,// Jest __tests__ directory
+  /(?:^|\/)tests?\//,   // tests/ or test/ directory
+];
+
+/**
+ * Return the active test-path patterns (env override or defaults).
+ * @returns {RegExp[]}
+ */
+function getTestPatterns() {
+  const envPatterns = process.env.GSD_T_TEST_PATTERNS;
+  if (envPatterns) {
+    try {
+      return envPatterns.split(",").map((p) => new RegExp(p.trim()));
+    } catch (_e) {
+      // fall through to defaults on bad regex
+    }
+  }
+  return DEFAULT_TEST_PATTERNS;
+}
+
+/**
+ * Return true if a funcId's file matches any test-path pattern.
+ * @param {string} funcId  — e.g. "test/foo.test.ts#myTest@12"
+ * @param {RegExp[]} patterns
+ * @returns {boolean}
+ */
+function isTestFile(funcId, patterns) {
+  const file = funcId.includes("#") ? funcId.split("#")[0] : funcId;
+  return patterns.some((re) => re.test(file));
+}
+
+// ─── UNRESOLVED sentinel (D9-T3 + D9-T4) ─────────────────────────────────────
+// The edge extractor emits UNRESOLVED#<name> when a call target cannot be resolved.
+// [RULE] test-impl-never-presents-unresolved-as-coverage — these must NEVER appear
+// in the implFuncs coverage set.
+
+const UNRESOLVED_PREFIX = "UNRESOLVED#";
+// A file the SCIP indexer ran for but never produced a document for (see
+// gsd-t-graph-scip-upgrade.cjs). [RULE] scip-missing-file-detected-never-silent
+const SCIP_MISSING_TIER = "tree-sitter-floor-SCIP-MISSING";
+// A file SCIP indexed but where too few repo-resolvable calls resolved to call it
+// compiler-accurate. [RULE] scip-tier-proportional
+const COMPILER_PARTIAL_TIER = "compiler-partial";
+// Tiers whose call edges SCIP actually looked at. An UNRESOLVED call in one of
+// these files is SCIP saying "not a repo function" (a local, a mock, a library),
+// so it is never name-matched. [RULE] name-match-only-where-scip-never-looked
+const SCIP_BACKED_TIERS = new Set(["compiler-accurate", COMPILER_PARTIAL_TIER]);
+
+/**
+ * Load records from a JSONL store directory.
+ * Returns null if the store is not present or is corrupt.
+ *
+ * @param {string} storePath
+ * @returns {{ records: object[] } | null}
+ */
+function loadJsonlStore(storePath) {
+  const recordsPath = path.join(storePath, "records.jsonl");
+  if (!fs.existsSync(recordsPath)) return null;
+
+  try {
+    const raw = fs.readFileSync(recordsPath, "utf8");
+    const lines = raw.split("\n").filter((l) => l.trim().length > 0);
+    const records = lines.map((l) => JSON.parse(l));
+    return { records };
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Load the skipped-file set from the D3-T6 SQLite meta table (best-effort).
+ * Returns a Set<string> of file paths that failed to parse.
+ * Returns an empty Set if the table is absent or the DB is not accessible.
+ *
+ * The store path may be either a JSONL directory (in which case we look for
+ * a graph.db sibling up the tree) or may be a .db path itself.
+ *
+ * @param {string|null} storePath
+ * @returns {Set<string>}
+ */
+function loadSkippedFiles(storePath) {
+  if (!storePath) return new Set();
+  try {
+    // storePath may be .gsd-t/graph-index/ (JSONL) or a .db path itself.
+    // All db path resolution goes through the M99 resolver. [RULE] one-resolver-only
+    let dbPath = null;
+    // Try storePath as a directory: look for graph.db via resolver (new graphDB/ layout first)
+    if (fs.existsSync(storePath) && fs.statSync(storePath).isDirectory()) {
+      // Derive project root from the JSONL dir (2-up), then resolve via resolver
+      const projRoot = _resolver.deriveProjectRoot(storePath);
+      const candidate = _resolver.resolveStorePath(projRoot);
+      if (fs.existsSync(candidate)) dbPath = candidate;
+    } else if (storePath.endsWith(".db") && fs.existsSync(storePath)) {
+      dbPath = storePath;
+    }
+    if (!dbPath) return new Set();
+
+    // Load the graph store engine via the M96 multi-location resolver.
+    let Database;
+    try {
+      Database = require("./gsd-t-require-store.cjs").requireBetterSqlite();
+    } catch (_e) {
+      return new Set();
+    }
+
+    const db = new Database(dbPath, { readonly: true });
+    const skipped = new Set();
+    try {
+      const rows = db.prepare("SELECT file FROM skipped_files").all();
+      for (const row of rows) skipped.add(row.file);
+    } catch (_e) {
+      // Table absent — normal for repos indexed before D3-T6 landed
+    } finally {
+      db.close();
+    }
+    return skipped;
+  } catch (_e) {
+    return new Set();
+  }
+}
+
+/**
+ * Compute the coverage field for a query result.
+ *
+ * [RULE] query-surfaces-incompleteness-never-silent-empty
+ *
+ * Logic: any file in the skipped set is a potential contributor to ANY query
+ * (it could have imported or called any target). So the coverage is incomplete
+ * whenever the skipped set is non-empty — we cannot know which of those files
+ * would have provided edges pointing at the query target.
+ *
+ * This is the conservative (correct) semantics: a clean empty result from a
+ * fully-parsed graph IS "no importers"; a clean empty result when 5 files failed
+ * to parse is NOT "no importers" — it is "no importers among the files we parsed".
+ *
+ * @param {Set<string>} skippedFiles  — files that failed to parse (D3-T6)
+ * @returns {{ complete: boolean, unparsedContributors?: number, note?: string }}
+ */
+function computeCoverage(skippedFiles, opts = {}) {
+  const n = (skippedFiles && skippedFiles.size) || 0;
+
+  // M114 — an UNRESOLVED file is as invisible to who-calls as an unparsed one.
+  // Parsing a file yields its call SITES; only compiler-accurate resolution says
+  // WHICH function each site targets. A floor-tier file parses fine, contributes
+  // zero resolved call edges, and never lands in skippedFiles — so coverage used
+  // to report complete:true while who-calls returned empty for an entire backend.
+  // "Nothing calls this" is what gets read right before a rename or a delete, so
+  // a false all-clear here is worse than no answer.
+  // Applies to CALL-edge queries only: IMPORT edges come from the parse, so
+  // who-imports and blast-radius are genuinely complete at floor tier.
+  const unresolved = opts.callEdgesUnresolved ? (opts.unresolvedFiles || 0) : 0;
+
+  if (n === 0 && !unresolved) return { complete: true };
+
+  const notes = [];
+  if (n) notes.push(`${n} file(s) unparsed`);
+  if (unresolved) {
+    notes.push(`${unresolved} file(s) parsed but not compiler-resolved — ` +
+      `call edges there are unknown, not absent`);
+  }
+  const coverage = {
+    complete: false,
+    note: `result may be incomplete — ${notes.join('; ')}`,
+  };
+  if (n) coverage.unparsedContributors = n;
+  if (unresolved) coverage.unresolvedContributors = unresolved;
+  return coverage;
+}
+
+/**
+ * Count files whose tier is NOT compiler-accurate — i.e. files that parsed but
+ * whose call targets were never resolved. These are invisible to who-calls.
+ *
+ * @param {{fileTier?: Map<string,string>}} index
+ * @returns {number}
+ */
+function countUnresolvedFiles(index) {
+  if (!index || !index.fileTier) return 0;
+  let n = 0;
+  for (const tier of index.fileTier.values()) {
+    if (tier && tier !== 'compiler-accurate') n++;
+  }
+  return n;
+}
+
+/**
+ * Build in-memory index structures from raw records.
+ *
+ * importGraph: Map<dstFile, Set<srcFile>> — reverse import edges (who imports dstFile)
+ * callGraph:   Map<dstFuncId, Set<srcFuncId>> — reverse call edges (who calls dstFuncId)
+ * forwardCallEdges: Array<{src,dst}> — raw forward call edges (for dangling detection)
+ * funcEntities: Map<funcId, {name, file, tier}> — entity lookup + tier for dead-code labeling
+ * allFiles:    Set<string> — all indexed file paths
+ * skippedFiles: Set<string> — files that failed to parse (D3-T6; empty if not provided)
+ *
+ * @param {object[]} records
+ * @param {Set<string>} [skippedFiles]  — optional set of skipped file paths from D3-T6
+ * @returns {IndexStructure}
+ */
+function buildIndex(records, skippedFiles) {
+  /** @type {Map<string,Set<string>>} */
+  const importGraph = new Map();
+  /** @type {Map<string,Set<string>>} */
+  const callGraph = new Map();
+  /** @type {Array<{src:string,dst:string,kind:string}>} */
+  const forwardCallEdges = [];
+  /** @type {Map<string,{name:string,file:string,tier:string}>} */
+  const funcEntities = new Map();
+  /** @type {Set<string>} */
+  const allFiles = new Set();
+  /** @type {Map<string,string>} file → tier (M114: who-calls needs the TARGET
+   * file's tier, not just the repo-wide dominant one). */
+  const fileTier = new Map();
+  /** @type {Map<string,{name:string,file:string,tier:string,endLine:?number,kind:string,meta:object}>}
+   * Drizzle tables + enums, kept OUT of funcEntities so dead-code / test-impl /
+   * who-calls never mistake a table for a function. [RULE] drizzle-table-entity-and-usage-edges */
+  const tableEntities = new Map();
+  /** @type {Map<string,Array<{src:string,access:string,op:string,line:number}>>} table code name → uses */
+  const tableUses = new Map();
+
+  let dominantTier = "compiler-accurate";
+  let hasFloor = false;
+  let hasStaleScip = false;
+
+  for (const rec of records) {
+    allFiles.add(rec.file);
+    if (rec.tier) fileTier.set(rec.file, rec.tier);
+
+    if (rec.tier === "tree-sitter-floor" || rec.tier === SCIP_MISSING_TIER || rec.tier === COMPILER_PARTIAL_TIER) hasFloor = true;
+    if (rec.tier === "tree-sitter-floor-STALE-SCIP") hasStaleScip = true;
+
+    // Index entities for bare-name disambiguation + tier labeling
+    if (Array.isArray(rec.entities)) {
+      for (const ent of rec.entities) {
+        if (ent.funcId && (ent.kind === "table" || ent.kind === "enum")) {
+          tableEntities.set(ent.funcId, {
+            name: ent.name, file: ent.file || rec.file, tier: ent.tier || rec.tier,
+            endLine: ent.endLine ?? null, kind: ent.kind, meta: ent.meta || {},
+          });
+        } else if (ent.funcId) {
+          funcEntities.set(ent.funcId, {
+            name: ent.name,
+            file: ent.file || rec.file,
+            tier: ent.tier || rec.tier,
+            endLine: ent.endLine ?? null,
+          });
+        }
+      }
+    }
+
+    // Build reverse edge indices + collect forward call edges for dangling detection
+    if (Array.isArray(rec.edges)) {
+      for (const edge of rec.edges) {
+        if (edge.kind === "IMPORT") {
+          // Reverse: dst ← src (who imports dst = src)
+          if (!importGraph.has(edge.dst)) importGraph.set(edge.dst, new Set());
+          importGraph.get(edge.dst).add(edge.src);
+        } else if (edge.kind === "CALL") {
+          // Reverse: dst ← src (who calls dst = src)
+          if (!callGraph.has(edge.dst)) callGraph.set(edge.dst, new Set());
+          callGraph.get(edge.dst).add(edge.src);
+          // Forward: collect ALL call edges for dangling + test-impl verbs
+          forwardCallEdges.push({ src: edge.src, dst: edge.dst, kind: "CALL" });
+        } else if (edge.kind === "TABLE-READ" || edge.kind === "TABLE-WRITE") {
+          // dst = TABLE#<name>#<operation>@<line>
+          const m = /^TABLE#([^#]+)#([^@]+)@(\d+)$/.exec(edge.dst);
+          if (m) {
+            if (!tableUses.has(m[1])) tableUses.set(m[1], []);
+            tableUses.get(m[1]).push({ src: edge.src, access: edge.kind.slice(6), op: m[2], line: Number(m[3]) });
+          }
+        }
+      }
+    }
+  }
+
+  if (hasStaleScip) dominantTier = "tree-sitter-floor-STALE-SCIP";
+  else if (hasFloor) dominantTier = "tree-sitter-floor";
+
+  return {
+    importGraph,
+    callGraph,
+    nameMatchedCallGraph: buildNameMatchedCallGraph(forwardCallEdges, funcEntities, fileTier),
+    forwardCallEdges,
+    funcEntities,
+    tableEntities,
+    tableUses,
+    allFiles,
+    fileTier,
+    tier: dominantTier,
+    skippedFiles: skippedFiles instanceof Set ? skippedFiles : new Set(),
+  };
+}
+
+/**
+ * Name-matched reverse call edges: `UNRESOLVED#<name>` → the ONE function in the
+ * repo named <name>, for callers in files SCIP never resolved (no SCIP document,
+ * floor, stale). A labelled answer, never a compiler one: who-calls reports these
+ * callers under `nameMatched` with `resolution: "name-matched"`.
+ * A name defined 2+ times is never matched — it stays in
+ * coverage.unresolvedCallSites. [RULE] unique-name-unresolved-call-name-matched
+ * [RULE] name-match-only-where-scip-never-looked
+ *
+ * @returns {Map<string,Set<string>>} dstFuncId (both `file#name@line` and `file#name`) → callers
+ */
+function buildNameMatchedCallGraph(forwardCallEdges, funcEntities, fileTier) {
+  const byName = new Map(); // name → [funcId, ...]
+  for (const [funcId, meta] of funcEntities) {
+    if (!byName.has(meta.name)) byName.set(meta.name, []);
+    byName.get(meta.name).push(funcId);
+  }
+  const graph = new Map();
+  for (const { src, dst } of forwardCallEdges) {
+    if (!dst.startsWith(UNRESOLVED_PREFIX)) continue;
+    const defs = byName.get(dst.slice(UNRESOLVED_PREFIX.length));
+    if (!defs || defs.length !== 1) continue;
+    // [RULE] name-match-only-where-scip-never-looked: include a caller ONLY if its
+    // file was NOT SCIP-backed (not compiler-accurate or compiler-partial). Files
+    // missing from fileTier default to tree-sitter-floor (SCIP never looked), so
+    // they are included. [ISSUE] M119: files outside tsconfig have no fileTier entry
+    // yet contribute valid UNRESOLVED edges → include them.
+    const callerFile = src.split("#")[0];
+    const callerTier = fileTier.get(callerFile);
+    // A missing tier → never SCIP-backed → include it (tree-sitter-floor by default)
+    if (callerTier !== undefined && SCIP_BACKED_TIERS.has(callerTier)) continue;
+    for (const key of new Set([defs[0], defs[0].replace(/@\d+$/, "")])) {
+      if (!graph.has(key)) graph.set(key, new Set());
+      graph.get(key).add(src);
+    }
+  }
+  return graph;
+}
+
+/**
+ * Callers of `funcId` found only by name match (not already compiler callers).
+ * @returns {string[]}
+ */
+function nameMatchedCallersOf(index, funcId, compilerCallers) {
+  if (!index.nameMatchedCallGraph) return [];
+  const set = index.nameMatchedCallGraph.get(funcId) || index.nameMatchedCallGraph.get(funcId.replace(/@\d+$/, ""));
+  if (!set) return [];
+  return Array.from(set).filter((c) => !compilerCallers.has(c)).sort();
+}
+
+/**
+ * who-calls envelope: compiler callers + labelled name-matched callers. A
+ * name-matched caller leaves coverage.unresolvedCallSites (it is accounted for).
+ */
+function whoCallsResult(index, funcId, baseCoverage, identity) {
+  const compiler = index.callGraph.get(funcId) || index.callGraph.get(funcId.replace(/@\d+$/, "")) || new Set();
+  const matched = nameMatchedCallersOf(index, funcId, compiler);
+  const results = Array.from(compiler).concat(matched).sort();
+  const coverage = withUnresolvedSites(baseCoverage, index, identity, matched);
+  if (!matched.length) return { results, tier: index.tier, coverage };
+  const out = { results, tier: index.tier, coverage };
+  out.nameMatched = {
+    resolution: "name-matched",
+    note: "unresolved call sites naming the only function in the repo with this name, in files SCIP never resolved — name-matched, not compiler-resolved",
+    count: matched.length,
+    callers: matched,
+  };
+  return out;
+}
+
+// ─── Load store + build index (fail-loud on any failure) ─────────────────────
+
+/**
+ * Load the on-disk store and build the in-memory index.
+ * Returns { ok: true, index: IndexStructure } on success.
+ * Returns { ok: false, reason: 'graph-unavailable' } on any load failure.
+ *
+ * Also loads the D3-T6 skipped-file set (best-effort; never fails the load).
+ *
+ * @param {string|null} storePath
+ * @returns {{ ok: boolean, index?: IndexStructure, reason?: string }}
+ */
+/**
+ * Load records from the SQLite store (`.gsd-t/graph.db`) — the store K1 PICKED
+ * and the indexer (gsd-t-graph-index.cjs) actually writes. The query CLI was
+ * originally JSONL-only; on a real SQLite index loadJsonlStore returned null and
+ * every query reported graph-unavailable. This reader reconstructs per-file
+ * records in the shape buildIndex expects ({file, entities, edges}).
+ *
+ * Edge normalization (bug fix): the indexer stores IMPORT edge `dst` as the RAW
+ * import specifier (e.g. "../../bin/x.cjs"), not a repo-relative path — so
+ * who-imports('bin/x.cjs') could never match. We resolve each relative specifier
+ * against its source file's directory to a repo-relative POSIX path so the
+ * import graph keys on real file ids. Bare/package specifiers (no leading '.')
+ * are left as-is (they're external modules, not repo files).
+ */
+function loadSqliteStore(dbPath) {
+  let Database;
+  try { Database = require("./gsd-t-require-store.cjs").requireBetterSqlite(); }
+  catch (_e) { return null; }
+  let db;
+  try {
+    db = new Database(dbPath, { readonly: true });
+    // M98: end_line is a post-M98 column; a pre-M98 graph (read-only here, so the
+    // write-path migration can't run) lacks it. Detect and select conditionally so
+    // an older index still loads (end_line just comes back null → body re-indexes).
+    const nodeCols = db.prepare("PRAGMA table_info(nodes)").all().map((c) => c.name);
+    const hasEndLine = nodeCols.includes("end_line");
+    // meta (table columns / enum values) is newer still — same conditional select.
+    const hasMeta = nodeCols.includes("meta");
+    const nodes = db.prepare(
+      `SELECT id, kind, tier, file, name, func_id, ${hasEndLine ? "end_line" : "NULL AS end_line"}, ${hasMeta ? "meta" : "NULL AS meta"} FROM nodes`
+    ).all();
+    const edges = db.prepare("SELECT kind, src, dst FROM edges").all();
+
+    const norm = (p) => p.replace(/\\/g, "/");
+    // The set of indexed file ids — used to resolve an extensionless import
+    // specifier (`./b`) to the actual file id (`src/b.ts`). Import specifiers in
+    // TS/JS routinely omit the extension; the graph keys on real file ids.
+    // Every indexed file appears as the `file` of its nodes (the indexer does not
+    // emit dedicated FILE nodes), so collect the distinct file set from there.
+    // [RULE] query-file-set-comes-from-files-table-not-inferred-from-functions
+    //
+    // hilo-figma-atos, 2026-08-11, the second half of the same miss. This set
+    // decides whether an extensionless import target can be matched to a real
+    // file. Built from node rows, it contains only files that declare a
+    // FUNCTION — so `src/lib/db.ts`, which exports a constant, was not in it,
+    // and no query could ever resolve an import of it. A file of constants,
+    // types, or re-exports is exactly the kind of shared module a whole codebase
+    // imports, and it was invisible.
+    //
+    // The indexer records every file it walked in the `files` table. That is the
+    // authoritative list; inferring one from functions was always an
+    // approximation of a fact already stored.
+    let fileIds;
+    const hasFilesTable = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='files'")
+      .get();
+    if (hasFilesTable) {
+      fileIds = new Set(
+        db.prepare("SELECT file FROM files").all().map((r) => norm(r.file)).filter(Boolean)
+      );
+    } else {
+      // A graph built before the files table existed. Node-derived is what this
+      // has always done — announced, because it under-reports imports of any
+      // file that declares no function.
+      fileIds = new Set(nodes.map((n) => norm(n.file)).filter(Boolean));
+      process.stderr.write(
+        "[graph] this index predates the files table — imports of constant-only/type-only files may be missed; re-run `gsd-t graph index`\n"
+      );
+    }
+    const EXTS = ["", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".py", "/index.ts", "/index.tsx", "/index.js"];
+    // [RULE] query-resolves-expanded-alias-not-only-relative
+    //
+    // hilo-figma-atos, 2026-08-11: `who-imports src/lib/db.ts` returned 5 of 793
+    // real importers. The 788 missing ones all wrote `@/lib/db`.
+    //
+    // The two halves of the alias fix did not meet. The indexer (v5.11.26)
+    // expands `@/lib/db` to `src/lib/db` — correct, and stored. But this
+    // resolver, which is what appends the file extension, skipped it: the gate
+    // below returned early for anything not starting with ".", treating an
+    // expanded project path exactly like the package import `react`. So the edge
+    // sat in the database as `src/lib/db` while the query asked for
+    // `src/lib/db.ts`, and the two never met.
+    //
+    // A relative specifier is resolved against its source file's directory; an
+    // expanded alias is ALREADY project-relative and must not be — joining it to
+    // the importer's directory would produce `src/app/src/lib/db`. So the two
+    // take different routes to the same place: add the extension either way.
+    // [RULE] query-resolves-js-specifier-to-ts-source
+    //
+    // binvoice, 2026-09-02: `who-imports src/content/dom-observer.ts` returned 0
+    // importers with coverage "complete" while five real importers sat in the
+    // edges table. TypeScript ESM requires an import to be WRITTEN `.js` even
+    // though the file on disk is `.ts` — so the edge says `./dom-observer.js`
+    // and no amount of appending extensions reaches `dom-observer.ts`. It has to
+    // SWAP the extension, not append to it. 817 of binvoice's 2,376 import edges
+    // (34%) were unresolvable this way, each answering "nothing imports this" —
+    // which reads as safe to delete.
+    const jsToTsCandidates = (p) => {
+      const m = /\.(js|jsx|mjs|cjs)$/.exec(p);
+      if (!m) return [];
+      const stem = p.slice(0, -m[0].length);
+      // .js->.ts/.tsx, .jsx->.tsx, .mjs->.mts, .cjs->.cts — the source files a
+      // bundler would have compiled INTO the specifier that was written.
+      return [stem + ".ts", stem + ".tsx", stem + ".mts", stem + ".cts"];
+    };
+
+    const resolveDst = (srcFile, dst) => {
+      if (typeof dst !== "string" || !dst) return dst;
+
+      if (!dst.startsWith(".")) {
+        // Not relative. Either a package ("react", "next/navigation") or an
+        // alias the indexer already expanded to a project path. The file set is
+        // what tells them apart — a package matches nothing in it.
+        const base = norm(dst);
+        for (const ext of EXTS) {
+          if (fileIds.has(base + ext)) return base + ext;
+        }
+        // An alias-expanded path can carry the same written-.js convention.
+        for (const cand of jsToTsCandidates(base)) {
+          if (fileIds.has(cand)) return cand;
+        }
+        return dst; // genuinely external — keep it exactly as written
+      }
+
+      const base = path.posix.normalize(path.posix.join(path.posix.dirname(norm(srcFile)), norm(dst)));
+      // Prefer an actual indexed file id (try the bare path, then common extensions).
+      for (const ext of EXTS) {
+        if (fileIds.has(base + ext)) return base + ext;
+      }
+      // TypeScript ESM: the import is written `.js`, the source is `.ts`. Swap,
+      // don't append. [RULE] query-resolves-js-specifier-to-ts-source
+      for (const cand of jsToTsCandidates(base)) {
+        if (fileIds.has(cand)) return cand;
+      }
+      return base; // no indexed match (external/missing) — keep the resolved path
+    };
+
+    // Group into per-file records.
+    const byFile = new Map();
+    const rec = (file) => {
+      if (!byFile.has(file)) byFile.set(file, { file, entities: [], edges: [] });
+      return byFile.get(file);
+    };
+    for (const n of nodes) {
+      if (n.func_id) {
+        rec(n.file).entities.push({
+          funcId: n.func_id, name: n.name, file: n.file, tier: n.tier, endLine: n.end_line, kind: n.kind,
+          ...(n.meta === null ? {} : { meta: JSON.parse(n.meta) }),
+        });
+      }
+    }
+    // M114 — carry each file's TIER onto its record. Without this the record is
+    // {file, entities, edges} with no tier, so the query layer cannot tell a
+    // compiler-resolved file from an unresolved one and coverage cannot report
+    // incompleteness. A file is only compiler-accurate if every entity is; a
+    // single floor entity means some call target in it is unknown.
+    for (const n of nodes) {
+      if (!n.file) continue;
+      const r = rec(n.file);
+      if (n.tier && n.tier !== 'compiler-accurate') r.tier = n.tier;
+      else if (!r.tier) r.tier = n.tier || 'compiler-accurate';
+    }
+    // The files table is where a SCIP-MISSING label lives even for a file that
+    // declares no function — so `graph status` can list every one of them.
+    if (hasFilesTable) {
+      for (const r of db.prepare("SELECT file, tier FROM files WHERE tier IN (?, ?)").all(SCIP_MISSING_TIER, COMPILER_PARTIAL_TIER)) {
+        rec(norm(r.file)).tier = r.tier;
+      }
+    }
+    for (const e of edges) {
+      // src for an IMPORT edge is the source FILE; for a CALL edge it's a funcId
+      // (file#fn@line). The owning file record is the src's file part.
+      const srcFile = e.src.includes("#") ? e.src.split("#")[0] : e.src;
+      const dst = e.kind === "IMPORT" ? resolveDst(srcFile, e.dst) : e.dst;
+      rec(srcFile).edges.push({ kind: e.kind, src: e.src, dst });
+    }
+    // A file with call edges but no function node (top-level code only) got no
+    // tier from the node pass. Name matching needs to know whether SCIP looked
+    // at it, so take its tier from the files table. [RULE] name-match-only-where-scip-never-looked
+    //
+    // Every file in the files table is a record, even one with no function and
+    // no edge (a types-only or constants-only file). Building records only from
+    // nodes/edges left those out, so `graph status` reported 4,301 files right
+    // after an index of 4,373 (hilo-figma-atos). [RULE] status-counts-files-table
+    if (hasFilesTable) {
+      for (const r of db.prepare("SELECT file, tier FROM files").all()) {
+        const f = norm(r.file);
+        const fr = rec(f);
+        if (r.tier && !fr.tier) fr.tier = r.tier;
+      }
+    }
+    db.close();
+    return { records: Array.from(byFile.values()) };
+  } catch (_e) {
+    try { if (db) db.close(); } catch {}
+    return null;
+  }
+}
+
+function loadStore(storePath) {
+  // ABSENT: no store file anywhere on disk (never indexed). [RULE] one-availability-classifier
+  if (!storePath) return { ok: false, reason: "graph-absent" };
+
+  // SQLite is the PICKED store (K1) — read it first; fall back to JSONL baseline.
+  // Sibling-db fallback uses resolver (not a raw path.join). [RULE] one-resolver-only
+  const _siblingDb = storePath.endsWith(".db") ? null : (() => {
+    const projRoot = _resolver.deriveProjectRoot(storePath);
+    return _resolver.resolveStorePath(projRoot);
+  })();
+  const loaded = (storePath.endsWith(".db") ? loadSqliteStore(storePath) : loadJsonlStore(storePath))
+    || loadJsonlStore(storePath) || (_siblingDb && fs.existsSync(_siblingDb) ? loadSqliteStore(_siblingDb) : null);
+  // BROKEN: a store file exists but could not be read/parsed (corrupt). NOT absent.
+  if (!loaded) return { ok: false, reason: "graph-broken", detail: "store present but unreadable" };
+
+  try {
+    // Load skipped files (best-effort — never fails the store load)
+    const skippedFiles = loadSkippedFiles(storePath);
+    const index = buildIndex(loaded.records, skippedFiles);
+    return { ok: true, index };
+  } catch (_e) {
+    // Store loaded but buildIndex threw on corrupt records → BROKEN, name the cause.
+    return { ok: false, reason: "graph-broken", detail: _e && _e.code ? _e.code : "buildIndex-failed" };
+  }
+}
+
+// ─── D4 freshness integration ─────────────────────────────────────────────────
+// D5 calls D4's freshness_check_on_query INLINE before answering any query.
+// If D4's module is absent, the graph is unavailable (fail-loud per the contract).
+//
+// D4 exports: { freshness_check_on_query, compute_touched_files }
+// Both are called from the same module — no grep fallback ever.
+
+/**
+ * Load D4's freshness module. Returns null if unavailable.
+ * If null, the caller MUST return graph-unavailable (fail-loud).
+ */
+function loadFreshnessModule() {
+  try {
+    const freshnessPath = path.join(__dirname, "gsd-t-graph-freshness.cjs");
+    return require(freshnessPath);
+  } catch (_e) {
+    return null;
+  }
+}
+
+/**
+ * Run D4's freshness check inline.
+ * Returns { ok: true } if index is fresh (or was re-indexed to become fresh).
+ * Returns { ok: false, reason: 'graph-unavailable' } if D4 is missing or fails.
+ *
+ * @param {string|null} storePath
+ * @returns {{ ok: boolean, reason?: string }}
+ */
+function runFreshnessCheck(storePath) {
+  const freshnessModule = loadFreshnessModule();
+  if (!freshnessModule) {
+    // D4 not yet built / unloadable — this is BROKEN infra (a missing require), not an
+    // un-indexed repo. Fail-loud per [RULE] parser-fail-disables-loud-never-silent.
+    return { ok: false, reason: "graph-broken", detail: "freshness module unavailable" };
+  }
+
+  try {
+    // D4's real signatures take (db, projectRoot, ...) — NOT (storePath). The
+    // projectRoot is derived via the M99 resolver (branch-aware depth fix).
+    // [RULE] projectroot-depth-corrected-with-move  [RULE] jsonl-branch-depth-preserved
+    // Pre-mortem #3: .db branch is 3-up post-graphDB/ move; JSONL branch stays 2-up.
+    const projectRoot = _resolver.deriveProjectRoot(storePath);
+    // Pass the exact storePath (canonical `.gsd-t/graph.db`) so openDb opens the
+    // real store, not a re-derived nested path. projectRoot is still used for the
+    // working-tree walk.
+    const db = freshnessModule.openDb(projectRoot, storePath.endsWith(".db") ? storePath : undefined);
+    // No real store at this root → fail-loud BEFORE deriving a touched-set.
+    // (Without this, a fake/non-existent storePath yields projectRoot="/" and
+    //  compute_touched_files walks the entire filesystem → OOM. [RULE]
+    //  parser-fail-disables-loud-never-silent: absent store = graph-unavailable.)
+    // No real store at this root → ABSENT (never indexed), not broken.
+    if (!db) return { ok: false, reason: "graph-absent" };
+    const touched = freshnessModule.compute_touched_files(db, projectRoot);
+    // parse_and_put (from D3) lets freshness re-index stale files; pass it when
+    // available so an edited file is refreshed before the answer.
+    let parseAndPut = null;
+    try { parseAndPut = require(path.join(__dirname, "gsd-t-graph-index.cjs")).parse_and_put; } catch { /* optional */ }
+    freshnessModule.freshness_check_on_query(db, projectRoot, touched, parseAndPut);
+    // Surface the touched-set so the query CLI can record freshness telemetry:
+    // edits = indexed files whose content-hash drifted (re-indexed before answering —
+    // i.e. a STALE query that was refreshed), adds = new files, deletes = removed.
+    // [RULE] freshness-telemetry-surfaced
+    const t = touched || {};
+    return {
+      ok: true,
+      editsCount: Array.isArray(t.edits) ? t.edits.length : 0,
+      addsCount: Array.isArray(t.adds) ? t.adds.length : 0,
+      deletesCount: Array.isArray(t.deletes) ? t.deletes.length : 0,
+      reindexedFiles: Array.isArray(t.edits) ? t.edits.slice(0, 20) : [],
+    };
+  } catch (_e) {
+    // Parse/corrupt/other freshness error → BROKEN, carry the cause code.
+    // Carry the message: "package.json is not valid JSON" must reach the user, not "freshness-failed".
+    return { ok: false, reason: "graph-broken", detail: _e && _e.code ? _e.code : ("freshness-failed: " + (_e && _e.message ? _e.message : String(_e))) };
+  }
+}
+
+// ─── Query: who-imports ───────────────────────────────────────────────────────
+
+/**
+ * who-imports(target): return all files that import `target`.
+ * Answers from the reverse import-graph index.
+ *
+ * Adds a `coverage` field per [RULE] query-surfaces-incompleteness-never-silent-empty:
+ * when the skipped-file set includes files that could have imported `target` (any
+ * file in the skipped set is a potential contributor), the coverage is incomplete.
+ *
+ * @param {IndexStructure} index
+ * @param {string} target  repo-relative POSIX path
+ * @returns {{ results: string[], tier: string, coverage: object }}
+ */
+function queryWhoImports(index, target) {
+  const importers = index.importGraph.get(target);
+  const results = importers ? Array.from(importers).sort() : [];
+  const coverage = computeCoverage(index.skippedFiles);
+  return { results, tier: index.tier, coverage };
+}
+
+// ─── Unresolved call sites that name the target ──────────────────────────────
+//
+// When coverage is incomplete, the calls the graph could not resolve are still
+// in it — as `UNRESOLVED#<name>` edges from a known caller. They are NOT results
+// (a name match is not a resolved call), so they are reported inside `coverage`,
+// labelled, with the files to open. That turns "[] and incomplete" into a named
+// place to look. [RULE] incomplete-empty-answer-names-a-path-forward
+
+function unresolvedCallSitesFor(index, identity, accounted) {
+  const name = identity.split("#").pop().replace(/@\d+$/, "");
+  if (!name) return null;
+  const exact = UNRESOLVED_PREFIX + name;
+  const member = "." + name;
+  const callers = new Set();
+  for (const { src, dst } of index.forwardCallEdges) {
+    if (dst === exact || (dst.startsWith(UNRESOLVED_PREFIX) && dst.endsWith(member))) callers.add(src);
+  }
+  // A caller already reported as name-matched is accounted for, not unknown.
+  if (accounted) for (const c of accounted) callers.delete(c);
+  if (callers.size === 0) return null;
+  const sorted = Array.from(callers).sort();
+  const files = Array.from(new Set(sorted.map((c) => c.split("#")[0]))).sort();
+  return {
+    count: sorted.length,
+    note: "name-match only — these callers call something named '" + name + "' that the graph could not resolve; open these files to confirm",
+    callers: sorted.slice(0, 100),
+    files: files.slice(0, 50),
+  };
+}
+
+function withUnresolvedSites(coverage, index, identity, accounted) {
+  if (!coverage || coverage.complete !== false) return coverage;
+  const sites = unresolvedCallSitesFor(index, identity, accounted);
+  return sites ? { ...coverage, unresolvedCallSites: sites } : coverage;
+}
+
+// ─── Query: who-calls ─────────────────────────────────────────────────────────
+
+/**
+ * who-calls(identity): return all callers of a function identified by funcId or bare name.
+ *
+ * Identity forms:
+ *   'file#function'         — file-qualified (exact funcId lookup)
+ *   'file#function@line'    — overload-qualified funcId
+ *   'function'              — bare name (may be ambiguous)
+ *
+ * Per [RULE] who-calls-function-identity-disambiguated:
+ *   - A file#function identity resolves exactly one funcId.
+ *   - A bare name matching multiple funcIds returns { ambiguous: true, candidates: [...] }.
+ *   - A bare name matching exactly one funcId resolves directly.
+ *   - NEVER merges callers across same-named functions.
+ *
+ * @param {IndexStructure} index
+ * @param {string} identity
+ * @returns {{ results?: string[], tier?: string, ambiguous?: boolean, candidates?: string[], notFound?: boolean }}
+ */
+function queryWhoCalls(index, identity) {
+  const isFuncId = identity.includes("#");
+  const baseCoverage = computeCoverage(index.skippedFiles, { callEdgesUnresolved: true, unresolvedFiles: countUnresolvedFiles(index) });
+  const coverage = withUnresolvedSites(baseCoverage, index, identity);
+
+  if (isFuncId) {
+    // File-qualified identity — exact funcId lookup (tolerate @line suffix:
+    // callGraph keys on `file#name`, callers may pass `file#name@line`).
+    return whoCallsResult(index, identity, baseCoverage, identity);
+  }
+
+  // Bare name — disambiguate against all funcIds
+  const bareName = identity;
+  const matchingFuncIds = [];
+  for (const [funcId, meta] of index.funcEntities) {
+    if (meta.name === bareName) {
+      matchingFuncIds.push(funcId);
+    }
+  }
+
+  if (matchingFuncIds.length === 0) {
+    const out = { results: [], tier: index.tier, coverage };
+    const hint = tableHint(index, bareName);
+    if (hint) out.hint = hint;
+    return out;
+  }
+
+  if (matchingFuncIds.length === 1) {
+    // Unambiguous bare name — resolve directly.
+    // funcEntities key as `file#name@line`, but call edges (and thus callGraph)
+    // key as `file#name` (no @line) — try both so the @line-suffix difference
+    // doesn't drop real callers. [RULE] who-calls-funcid-line-suffix-tolerant
+    return whoCallsResult(index, matchingFuncIds[0], baseCoverage, identity);
+  }
+
+  // Multiple matches — ambiguous, NEVER merge
+  return { ambiguous: true, candidates: matchingFuncIds.sort() };
+}
+
+/** A who-calls on a table name (or a table builder) is a table question — say which verbs answer it. */
+function tableHint(index, name) {
+  if (name === "pgTable" || name === "mysqlTable" || name === "sqliteTable" || name === "pgEnum") {
+    return `${name} declares database tables — the graph records each one: gsd-t graph table <name>, gsd-t graph who-uses <name>`;
+  }
+  const r = resolveTable(index, name);
+  if (r.notFound) return null;
+  return `'${name}' is a database ${r.table ? r.table.kind : "table"} — ask: gsd-t graph who-uses ${name}  |  gsd-t graph table ${name}  |  gsd-t graph blast-radius ${name}`;
+}
+
+// ─── Query: body (M98) ────────────────────────────────────────────────────────
+
+/**
+ * body(identity): return a single function's SOURCE — read LIVE from disk by line
+ * range — plus context (the file's import lines + the enclosing class header if a
+ * method + the caller list from the call graph). The headline "smart-reach" win:
+ * ~180 tokens for one function vs ~7,750 for the whole file.
+ *
+ * Resolution mirrors who-calls disambiguation [RULE] who-calls-function-identity-disambiguated:
+ *   - exact funcId (`file#name@line`) → that node
+ *   - bare `name` matching exactly one node → that node
+ *   - bare `name` matching N>1 → { ambiguous:true, candidates:[...] } — NEVER a merged body
+ *   - no match → { notFound:true }
+ *
+ * INVARIANTS (feed verify gate, contract §2):
+ *   [RULE] body-reads-live-never-stored          — source comes from a live disk read, not a DB blob
+ *   [RULE] body-freshness-reindex-before-slice    — Step-1 freshness re-indexes a stale file BEFORE this runs
+ *   [RULE] body-ambiguous-never-merged            — ambiguous symbol → candidates, never a wrong/joined body
+ *   [RULE] body-end-line-required                 — a node with NULL end_line returns needsReindex (caller re-indexes)
+ *
+ * @param {IndexStructure} index
+ * @param {string} identity   funcId or bare name
+ * @param {string} projectRoot  repo root (live file read is relative to this)
+ * @returns {{ ok?:boolean, funcId?:string, file?:string, lineRange?:[number,number],
+ *             tier?:string, imports?:string[], classHeader?:?string, source?:string,
+ *             callers?:string[], ambiguous?:boolean, candidates?:string[],
+ *             notFound?:boolean, needsReindex?:boolean }}
+ */
+function queryBody(index, identity, projectRoot) {
+  // ── Resolve identity → a single funcId ──
+  let funcId = null;
+  if (identity.includes("#")) {
+    // File-qualified. Tolerate a missing @line suffix (funcEntities key carries it).
+    if (index.funcEntities.has(identity)) {
+      funcId = identity;
+    } else {
+      const noLine = identity.replace(/@\d+$/, "");
+      for (const fid of index.funcEntities.keys()) {
+        if (fid === noLine || fid.replace(/@\d+$/, "") === noLine) { funcId = fid; break; }
+      }
+    }
+  } else {
+    // Bare name — disambiguate, NEVER merge.
+    const matches = [];
+    for (const [fid, meta] of index.funcEntities) {
+      if (meta.name === identity) matches.push(fid);
+    }
+    if (matches.length === 1) funcId = matches[0];
+    else if (matches.length > 1) return { ambiguous: true, candidates: matches.sort() };
+  }
+
+  if (!funcId) {
+    // Not a function — a database table or enum? [RULE] drizzle-table-entity-and-usage-edges
+    const tr = resolveTable(index, identity);
+    if (tr.ambiguous) return tr;
+    if (!tr.table) return { notFound: true };
+    return tableBody(index, tr.table, projectRoot);
+  }
+
+  const meta = index.funcEntities.get(funcId);
+  // Start line is encoded in the funcId suffix `@<line>`; end_line from the node.
+  const startMatch = /@(\d+)$/.exec(funcId);
+  const startLine = startMatch ? parseInt(startMatch[1], 10) : null;
+  const endLine = meta.endLine;
+
+  // [RULE] body-end-line-required — a pre-M98 node has no end_line; caller re-indexes.
+  if (startLine == null || endLine == null) {
+    return { needsReindex: true, funcId, file: meta.file };
+  }
+
+  // [RULE] body-reads-live-never-stored — slice the live file by line range.
+  const absFile = path.isAbsolute(meta.file) ? meta.file : path.join(projectRoot, meta.file);
+  let lines;
+  try { lines = fs.readFileSync(absFile, "utf8").split("\n"); }
+  catch (_e) { return { notFound: true, file: meta.file }; }
+
+  const source = lines.slice(startLine - 1, endLine).join("\n");
+
+  // Context: the file's top-level import/require lines.
+  const imports = [];
+  for (const ln of lines) {
+    const t = ln.trim();
+    if (/^(import\s|export\s.*\sfrom\s|const\s+\w+\s*=\s*require\(|.*\brequire\()/.test(t) && /from\s|require\(/.test(t)) {
+      imports.push(ln);
+    }
+    if (imports.length >= 40) break; // safety cap
+  }
+
+  // Context: enclosing class header (if this funcId is a method — its line sits
+  // inside a `class X {` block above it). Best-effort: nearest preceding class line.
+  let classHeader = null;
+  for (let i = startLine - 2; i >= 0; i--) {
+    const m = /^\s*(export\s+)?(abstract\s+)?class\s+[A-Za-z_$][\w$]*/.exec(lines[i]);
+    if (m) { classHeader = lines[i].trim(); break; }
+    // Stop if we hit a top-level non-indented statement that isn't a class (cheap bound).
+    if (/^\S/.test(lines[i]) && !/^(export|import|\/\/|\/\*|\*)/.test(lines[i])) break;
+  }
+
+  // Context: callers from the existing call graph (free).
+  const fidNoLine = funcId.replace(/@\d+$/, "");
+  const callerSet = index.callGraph.get(funcId) || index.callGraph.get(fidNoLine);
+  const callers = callerSet ? Array.from(callerSet).sort() : [];
+
+  return {
+    ok: true,
+    funcId,
+    file: meta.file,
+    lineRange: [startLine, endLine],
+    tier: meta.tier || index.tier,
+    imports,
+    classHeader,
+    source,
+    callers,
+  };
+}
+
+/** body of a table: its declaration sliced live from disk + columns + FKs both ways. */
+function tableBody(index, t, projectRoot) {
+  const startLine = parseInt(/@(\d+)$/.exec(t.id)[1], 10);
+  const absFile = path.isAbsolute(t.file) ? t.file : path.join(projectRoot, t.file);
+  let lines;
+  try { lines = fs.readFileSync(absFile, "utf8").split("\n"); }
+  catch (_e) { return { notFound: true, file: t.file }; }
+  return {
+    ok: true,
+    funcId: t.id,
+    file: t.file,
+    lineRange: [startLine, t.endLine],
+    tier: t.tier,
+    imports: [],
+    classHeader: null,
+    source: lines.slice(startLine - 1, t.endLine).join("\n"),
+    callers: [],
+    table: tableDetail(index, t),
+  };
+}
+
+// ─── Query: blast-radius ──────────────────────────────────────────────────────
+
+/**
+ * blast-radius(target): downstream impact set — UNION of reverse-reachable nodes
+ * from `target` in BOTH the import graph AND the call graph, transitive closure.
+ *
+ * Per [RULE] blast-radius-unions-both-graphs:
+ *   - Import graph: file→file (reverse: who transitively imports target)
+ *   - Call graph:   funcId→funcId (reverse: who transitively calls target)
+ *   - Both graphs UNIONED: a node reachable via EITHER is in the set.
+ *   - Transitive closure (full reverse-reachable), NOT one-hop.
+ *   - A node reachable via ONLY the call graph MUST appear (not just import-reachable).
+ *   - A node reachable via NEITHER is excluded.
+ *
+ * File-root expansion:
+ *   When `target` is a FILE path (not a funcId — no '#'), the BFS initial frontier is
+ *   expanded to include ALL funcIds owned by that file. This ensures call-graph-only
+ *   downstream nodes (callers of functions IN the target file) are included in the
+ *   blast radius, not just import-graph reachable nodes.
+ *
+ *   Why: the call-graph edges are keyed by funcId (e.g. "target.ts#targetFn"), not by
+ *   file. A query like blast-radius("target.ts") without expansion would only follow
+ *   import-graph edges, missing any function callers — producing an under-broad result.
+ *   The UNION semantics require expanding to both the file node AND its owned funcIds.
+ *
+ * Note: blast-radius is a SEQUENCED-FOLLOW-ON deliverable per
+ * [RULE] blast-radius-sequenced-follow-on-not-phase1-consumed — it is built and
+ * tested here (D5-T1 verb + D5-T3 union fixture) but has ZERO Phase-1 consumer.
+ * Its /impact + /debug consumers are DEFERRED. This is an honest foundation.
+ *
+ * @param {IndexStructure} index
+ * @param {string} target  file path or funcId
+ * @returns {{ results: string[], tier: string }}
+ */
+function queryBlastRadius(index, target) {
+  // A database table (by code name, SQL name, or id) — not a file, not a function.
+  if (!index.allFiles.has(target) && !index.funcEntities.has(target)) {
+    const tr = resolveTable(index, target);
+    if (tr.table) return queryTableBlastRadius(index, tr.table);
+    if (tr.ambiguous) return tr;
+  }
+  const isFilePath = !target.includes("#");
+
+  // Build the initial frontier (multi-root if file-path: include owned funcIds)
+  const initialFrontier = new Set([target]);
+
+  if (isFilePath) {
+    // Expand file-root to include ALL funcIds owned by this file.
+    // This is the UNION seam: call-graph edges are keyed by funcId, not file.
+    // Without this expansion, callers of target's functions would be missed.
+    for (const [funcId, meta] of index.funcEntities) {
+      if (meta.file === target) {
+        initialFrontier.add(funcId);
+        // SCIP-resolved call edges key on `file#name` (no @line) — seed that
+        // form too, or a file's callers never enter the radius.
+        // [RULE] who-calls-funcid-line-suffix-tolerant
+        initialFrontier.add(funcId.replace(/@\d+$/, ""));
+      }
+    }
+  }
+
+  // BFS over the UNION of reverse import + call edges, transitive closure
+  const visited = new Set();
+  const nameMatchedReached = new Set();
+  const queue = Array.from(initialFrontier);
+
+  while (queue.length > 0) {
+    const node = queue.shift();
+    if (visited.has(node)) continue;
+    visited.add(node);
+
+    // Reverse import edges: who imports this file node?
+    const importers = index.importGraph.get(node);
+    if (importers) {
+      for (const imp of importers) {
+        if (!visited.has(imp)) queue.push(imp);
+      }
+    }
+
+    // Reverse call edges: who calls this function node? (compiler + name-matched;
+    // name-matched ones are listed separately below) [RULE] unique-name-unresolved-call-name-matched
+    for (const graph of [index.callGraph, index.nameMatchedCallGraph]) {
+      const callers = graph && graph.get(node);
+      if (!callers) continue;
+      for (const caller of callers) {
+        if (graph !== index.callGraph && !(index.callGraph.get(node) || new Set()).has(caller)) nameMatchedReached.add(caller);
+        if (!visited.has(caller)) queue.push(caller);
+      }
+    }
+  }
+
+  // Exclude the initial frontier (the root and its owned funcIds) from the result set.
+  // They are roots, not downstream nodes.
+  for (const root of initialFrontier) {
+    visited.delete(root);
+  }
+
+  const results = Array.from(visited).sort();
+  const matched = Array.from(nameMatchedReached).filter((c) => visited.has(c)).sort();
+  const coverage = withUnresolvedSites(
+    computeCoverage(index.skippedFiles, { callEdgesUnresolved: true, unresolvedFiles: countUnresolvedFiles(index) }),
+    index, target, matched);
+  if (!matched.length) return { results, tier: index.tier, coverage };
+  return {
+    results, tier: index.tier, coverage,
+    nameMatched: { resolution: "name-matched", count: matched.length, callers: matched.slice(0, 100) },
+  };
+}
+
+// ─── Database tables (Drizzle) ────────────────────────────────────────────────
+//
+// Verbs: `table <name>`, `who-uses <table> [--writes|--reads]`, and table mode of
+// `blast-radius` and `body`. A table is found by its code name (scheduleEvents)
+// or its SQL name (schedule_events, case-insensitive — a domain value).
+// Uses are matched by the table's exported name as written at the use site
+// (syntactic, not compiler-resolved): an import alias is followed, a table passed
+// through a function parameter is not. [RULE] drizzle-table-entity-and-usage-edges
+// [RULE] table-not-indexed-distinct-from-no-users
+
+/** → { table: {id, ...meta} } | { ambiguous, candidates } | { notFound } */
+function resolveTable(index, target) {
+  if (!index.tableEntities) return { notFound: true };
+  if (target.includes("#")) {
+    const noLine = target.replace(/@\d+$/, "");
+    for (const [id, t] of index.tableEntities) {
+      if (id === target || id.replace(/@\d+$/, "") === noLine) return { table: { id, ...t } };
+    }
+    return { notFound: true };
+  }
+  const byCode = [];
+  const bySql = [];
+  const lower = target.toLowerCase();
+  for (const [id, t] of index.tableEntities) {
+    if (t.name === target) byCode.push(id);
+    else if (typeof t.meta.sqlName === "string" && t.meta.sqlName.toLowerCase() === lower) bySql.push(id);
+  }
+  const ids = byCode.length ? byCode : bySql;
+  if (ids.length === 0) return { notFound: true };
+  if (ids.length > 1) return { ambiguous: true, candidates: ids.sort() };
+  return { table: { id: ids[0], ...index.tableEntities.get(ids[0]) } };
+}
+
+function notIndexedDetail(index, target) {
+  const n = index.tableEntities ? index.tableEntities.size : 0;
+  return `no table or enum named '${target}' is indexed (${n} tables/enums in the graph, found by code name or SQL name) — ` +
+    `check the name; if it was declared since the last build, run: gsd-t graph index`;
+}
+
+/** Table ids declared under a code name (FK targets are written as code names). */
+function tableIdsNamed(index, name) {
+  const ids = [];
+  for (const [id, t] of index.tableEntities) if (t.name === name) ids.push(id);
+  return ids.sort();
+}
+
+/** Foreign keys out of `t` (column-level references + table-level foreignKey()). */
+function foreignKeysOut(index, t) {
+  const out = [];
+  for (const c of t.meta.columns ? t.meta.columns : []) {
+    if (!c.references) continue;
+    out.push({ column: c.name, sqlColumn: c.sqlName, table: c.references.table, targetColumn: c.references.column, tableIds: tableIdsNamed(index, c.references.table) });
+  }
+  for (const fk of t.meta.foreignKeys ? t.meta.foreignKeys : []) {
+    out.push({ column: fk.columns.join(", "), table: fk.table, targetColumn: fk.foreignColumns.join(", "), tableIds: tableIdsNamed(index, fk.table) });
+  }
+  return out;
+}
+
+/** Foreign keys INTO `t` from every other indexed table. */
+function foreignKeysIn(index, t) {
+  const refs = [];
+  for (const [id, other] of index.tableEntities) {
+    if (other.kind !== "table") continue;
+    for (const fk of foreignKeysOut(index, other)) {
+      if (fk.table === t.name) refs.push({ table: other.name, tableId: id, column: fk.column, sqlColumn: fk.sqlColumn, targetColumn: fk.targetColumn });
+    }
+  }
+  return refs.sort((a, b) => (a.tableId + a.column < b.tableId + b.column ? -1 : 1));
+}
+
+function tableDetail(index, t) {
+  const detail = {
+    id: t.id, kind: t.kind, name: t.name, sqlName: t.meta.sqlName, dialect: t.meta.dialect, file: t.file,
+  };
+  if (t.kind === "enum") {
+    detail.values = t.meta.values;
+    // Tables whose columns are built from this enum (`statusEnum('status')`).
+    detail.usedByColumns = [];
+    for (const [id, other] of index.tableEntities) {
+      for (const c of other.meta.columns ? other.meta.columns : []) {
+        if (c.type === t.name) detail.usedByColumns.push({ table: other.name, tableId: id, column: c.name, sqlColumn: c.sqlName });
+      }
+    }
+  } else {
+    detail.columns = t.meta.columns;
+    detail.references = foreignKeysOut(index, t);
+    detail.referencedBy = foreignKeysIn(index, t);
+  }
+  if (t.meta.unresolved) detail.unresolved = t.meta.unresolved;
+  return detail;
+}
+
+/** `table <name>` → columns + foreign keys in both directions. */
+function queryTable(index, target) {
+  const r = resolveTable(index, target);
+  if (!r.table) return r.ambiguous ? r : { notFound: true, detail: notIndexedDetail(index, target) };
+  return { table: tableDetail(index, r.table), tier: index.tier };
+}
+
+/** `who-uses <table> [--writes|--reads]` → the functions / methods / route handlers that use it. */
+function queryWhoUses(index, target, options) {
+  const mode = options && options.mode ? options.mode : "all";
+  const r = resolveTable(index, target);
+  if (!r.table) return r.ambiguous ? r : { notFound: true, detail: notIndexedDetail(index, target) };
+  const t = r.table;
+  const all = index.tableUses.has(t.name) ? index.tableUses.get(t.name) : [];
+  const uses = all.filter((u) => mode === "all" || (mode === "writes" ? u.access === "WRITE" : u.access === "READ"));
+  const byUser = new Map();
+  const byOperation = {};
+  for (const u of uses) {
+    if (!byUser.has(u.src)) byUser.set(u.src, { user: u.src, file: u.src.split("#")[0], access: [], operations: {} });
+    const row = byUser.get(u.src);
+    if (!row.access.includes(u.access)) row.access.push(u.access);
+    if (!row.operations[u.op]) row.operations[u.op] = [];
+    row.operations[u.op].push(u.line);
+    byOperation[u.op] = (byOperation[u.op] ? byOperation[u.op] : 0) + 1;
+  }
+  const results = Array.from(byUser.values()).sort((a, b) => (a.user < b.user ? -1 : 1));
+  for (const row of results) row.access.sort();
+  const out = {
+    table: { id: t.id, name: t.name, sqlName: t.meta.sqlName, kind: t.kind },
+    mode,
+    results,
+    summary: { users: results.length, files: new Set(results.map((x) => x.file)).size, byOperation },
+    resolution: "syntactic — uses matched by the table's imported name; a table passed through a function parameter or alias() is not followed",
+    coverage: computeCoverage(index.skippedFiles),
+    tier: index.tier,
+  };
+  const sharing = tableIdsNamed(index, t.name);
+  if (sharing.length > 1) out.sharedName = { note: `${sharing.length} tables share the code name '${t.name}' — uses cannot be split between them`, tables: sharing };
+  if (results.length === 0) {
+    out.note = mode === "all"
+      ? `'${t.name}' is indexed; no code in the index uses it`
+      : `'${t.name}' is indexed; no code in the index ${mode === "writes" ? "writes" : "reads"} it`;
+  }
+  return out;
+}
+
+/** blast-radius of a table: tables that reference it by FK (transitively) + the code that uses it. */
+function queryTableBlastRadius(index, t) {
+  const tables = [];
+  const seen = new Set([t.id]);
+  const queue = [{ table: t, depth: 1 }];
+  while (queue.length) {
+    const { table, depth } = queue.shift();
+    for (const ref of foreignKeysIn(index, table)) {
+      if (seen.has(ref.tableId)) continue;
+      seen.add(ref.tableId);
+      tables.push({ id: ref.tableId, via: `${ref.table}.${ref.column} → ${table.name}.${ref.targetColumn}`, depth });
+      queue.push({ table: { id: ref.tableId, ...index.tableEntities.get(ref.tableId) }, depth: depth + 1 });
+    }
+  }
+  const users = (index.tableUses.has(t.name) ? index.tableUses.get(t.name) : []).map((u) => u.src);
+  const code = Array.from(new Set(users)).sort();
+  return {
+    results: tables.map((x) => x.id).concat(code),
+    table: { id: t.id, name: t.name, sqlName: t.meta.sqlName },
+    referencingTables: tables,
+    users: code,
+    tier: index.tier,
+    coverage: computeCoverage(index.skippedFiles),
+  };
+}
+
+// ─── Query: status ────────────────────────────────────────────────────────────
+
+/**
+ * status: return live queryable index state.
+ * Per [RULE] graph-status-live — must return a LIVE queryable index;
+ * the M20–M21 "no graph index found" is the anti-goal.
+ *
+ * @param {IndexStructure} index
+ * @param {string} storePath
+ * @returns {object}
+ */
+function queryStatus(index, storePath) {
+  // [RULE] scip-missing-file-detected-never-silent — status names them.
+  const scipMissing = [];
+  for (const [file, tier] of index.fileTier || []) if (tier === SCIP_MISSING_TIER) scipMissing.push(file);
+  scipMissing.sort();
+  return {
+    scipMissing: { count: scipMissing.length, files: scipMissing.slice(0, 50) },
+    queryable: true,
+    storePath,
+    fileCount: index.allFiles.size,
+    funcCount: index.funcEntities.size,
+    importEdgeCount: Array.from(index.importGraph.values()).reduce((s, v) => s + v.size, 0),
+    callEdgeCount: Array.from(index.callGraph.values()).reduce((s, v) => s + v.size, 0),
+    // `tier` is the WORST tier present (one floor file makes it floor). The per-tier
+    // counts are what a build reports, so status shows them too. [RULE] status-counts-files-table
+    tier: index.tier,
+    tiers: tierCounts(index),
+    tableCount: countKind(index, "table"),
+    enumCount: countKind(index, "enum"),
+    excludeSuggestions: suggestExcludes(index),
+  };
+}
+
+function tierCounts(index) {
+  const counts = {};
+  for (const tier of (index.fileTier ? index.fileTier.values() : [])) counts[tier] = (counts[tier] ? counts[tier] : 0) + 1;
+  return counts;
+}
+
+function countKind(index, kind) {
+  let n = 0;
+  for (const t of (index.tableEntities ? index.tableEntities.values() : [])) if (t.kind === kind) n++;
+  return n;
+}
+
+/**
+ * Top-level folders that look like they are not the application: no file in them
+ * imports, or is imported by, a file in the project's largest folder (the app).
+ * A SUGGESTION for .gsd-t/graph-exclude.json — never applied automatically, since
+ * guessing wrong would silently drop app code from the graph.
+ */
+function suggestExcludes(index) {
+  const top = (f) => (f.includes("/") ? f.split("/")[0] : null);
+  const sizes = new Map();
+  for (const f of index.allFiles) {
+    const t = top(f);
+    if (t !== null) sizes.set(t, (sizes.has(t) ? sizes.get(t) : 0) + 1);
+  }
+  if (sizes.size < 2) return [];
+  const main = Array.from(sizes.entries()).sort((a, b) => b[1] - a[1])[0][0];
+  const linked = new Set([main]);
+  for (const [dst, srcs] of index.importGraph) {
+    if (!index.allFiles.has(dst)) continue;
+    const d = top(dst);
+    for (const src of srcs) {
+      const sTop = top(src);
+      if (d === main && sTop !== null) linked.add(sTop);
+      if (sTop === main && d !== null) linked.add(d);
+    }
+  }
+  return Array.from(sizes.entries())
+    .filter(([folder]) => !linked.has(folder))
+    .sort((a, b) => b[1] - a[1])
+    .map(([folder, files]) => ({ folder: folder + "/", files, reason: `no import edges to or from ${main}/` }));
+}
+
+// ─── D9-T1: Query: cluster (tightly-coupled file groups) ─────────────────────
+//
+// [RULE] cluster-verb-deterministic-coupling
+// Algorithm: shared-neighbour coupling over the IMPORT graph.
+// Coupling score between files A and B = (|shared import targets| + |shared importers|)
+// normalised by (|A's neighbours| + |B's neighbours|). This is a DETERMINISTIC metric
+// (same edges → same score → same grouping), NOT an LLM judgment.
+//
+// Grouping: Union-Find over all file pairs whose coupling score ≥ COUPLING_THRESHOLD.
+// A file with NO other coupled file becomes its own singleton cluster.
+//
+// Consumers: /partition (domain-boundary suggestion), /project (milestone decomposition).
+
+const COUPLING_THRESHOLD = 0.2; // declared in contract — files sharing ≥20% of their import neighbourhood
+
+/**
+ * Union-Find (path-compressed) for cluster grouping.
+ * @param {string[]} items
+ */
+function makeUnionFind(items) {
+  const parent = new Map(items.map((x) => [x, x]));
+  function find(x) {
+    if (parent.get(x) !== x) parent.set(x, find(parent.get(x)));
+    return parent.get(x);
+  }
+  function union(x, y) {
+    const rx = find(x), ry = find(y);
+    if (rx !== ry) parent.set(rx, ry);
+  }
+  return { find, union, parent };
+}
+
+/**
+ * cluster: return tightly-coupled file groups by a DETERMINISTIC coupling metric.
+ *
+ * @param {IndexStructure} index
+ * @returns {{ results: Array<{files:string[], couplingScore:number}>, tier: string }}
+ */
+function queryCluster(index) {
+  const files = Array.from(index.allFiles).sort(); // deterministic order
+
+  // Build forward import adjacency: srcFile → Set<dstFile>
+  // importGraph is reverse (dst→Set<src>), so we invert it.
+  /** @type {Map<string,Set<string>>} */
+  const importTargets = new Map(); // file → files it imports
+  /** @type {Map<string,Set<string>>} */
+  const importedBy = index.importGraph;   // file → files that import it (already built)
+
+  for (const [dst, srcs] of importedBy) {
+    for (const src of srcs) {
+      if (!importTargets.has(src)) importTargets.set(src, new Set());
+      importTargets.get(src).add(dst);
+    }
+  }
+
+  // Compute pairwise coupling scores for all file pairs that share at least one neighbour.
+  // Only compute O(N²) where N = files with edges — skip fully-isolated files for pairing.
+  const uf = makeUnionFind(files);
+
+  // For each unique pair (i < j), compute coupling = Jaccard over import neighbourhood.
+  // neighbourhood(f) = importTargets(f) ∪ importedBy(f)
+  const neighbourhood = new Map();
+  for (const f of files) {
+    const nb = new Set();
+    if (importTargets.has(f)) for (const x of importTargets.get(f)) nb.add(x);
+    if (importedBy.has(f))    for (const x of importedBy.get(f))    nb.add(x);
+    neighbourhood.set(f, nb);
+  }
+
+  for (let i = 0; i < files.length; i++) {
+    const a = files[i];
+    const nbA = neighbourhood.get(a);
+    if (nbA.size === 0) continue;
+    for (let j = i + 1; j < files.length; j++) {
+      const b = files[j];
+      const nbB = neighbourhood.get(b);
+      if (nbB.size === 0) continue;
+      // Jaccard(A,B) = |A∩B| / |A∪B|
+      let intersection = 0;
+      for (const x of nbA) if (nbB.has(x)) intersection++;
+      const unionSize = nbA.size + nbB.size - intersection;
+      if (unionSize === 0) continue;
+      const score = intersection / unionSize;
+      if (score >= COUPLING_THRESHOLD) {
+        uf.union(a, b);
+      }
+    }
+  }
+
+  // Collect groups
+  const groupMap = new Map();
+  for (const f of files) {
+    const root = uf.find(f);
+    if (!groupMap.has(root)) groupMap.set(root, []);
+    groupMap.get(root).push(f);
+  }
+
+  // Sort groups by descending size, then by first file name (deterministic)
+  const groups = Array.from(groupMap.values());
+  groups.sort((a, b) => {
+    if (b.length !== a.length) return b.length - a.length;
+    return a[0] < b[0] ? -1 : 1;
+  });
+
+  // Compute a representative coupling score for each group (average pairwise Jaccard among members)
+  const results = groups.map((group) => {
+    if (group.length === 1) return { files: group, couplingScore: 0 };
+    let totalScore = 0, pairs = 0;
+    for (let i = 0; i < group.length; i++) {
+      const nbA = neighbourhood.get(group[i]);
+      for (let j = i + 1; j < group.length; j++) {
+        const nbB = neighbourhood.get(group[j]);
+        let intersection = 0;
+        for (const x of nbA) if (nbB.has(x)) intersection++;
+        const unionSize = nbA.size + nbB.size - intersection;
+        if (unionSize > 0) totalScore += intersection / unionSize;
+        pairs++;
+      }
+    }
+    const avg = pairs > 0 ? totalScore / pairs : 0;
+    return { files: group, couplingScore: Math.round(avg * 1000) / 1000 };
+  });
+
+  return { results, tier: index.tier };
+}
+
+// ─── D9-T2: Query: dead-code / orphan (no inbound edges) ─────────────────────
+//
+// [RULE] dead-code-verb-excludes-entrypoints-and-exports
+// Exclusions (declared here and in the contract):
+//   1. Files matching ENTRY_POINT_PATTERNS (bin/, main.*, index.*, cli.*)
+//   2. Test files (matched by DEFAULT_TEST_PATTERNS) — these intentionally have no callers
+//   3. Functions whose name starts with an uppercase letter (exported class constructors / public API)
+//   4. Functions named "exports", "module.exports", or matching EXPORTED_FUNC_PATTERNS
+//
+// [RULE] orphan-tier-labeled-candidate-not-certainty
+//   Tree-sitter-floor-tier orphans are labeled CANDIDATE (a missed unresolved call
+//   could make a live function look orphan). Compiler-accurate orphans labeled accordingly.
+
+const ENTRY_POINT_PATTERNS = [
+  /(?:^|\/)bin\//,
+  /(?:^|\/)main\.[^.]+$/,
+  /(?:^|\/)index\.[^.]+$/,
+  /(?:^|\/)cli\.[^.]+$/,
+  /(?:^|\/)app\.[^.]+$/,
+  /(?:^|\/)server\.[^.]+$/,
+];
+
+const EXPORTED_FUNC_PATTERNS = [
+  /^exports?\./,
+  /^module\.exports/,
+];
+
+/**
+ * dead-code / orphan: return function entities with no inbound edges (callers or importers).
+ * Applies declared exclusions and tier-honest CANDIDATE labeling.
+ *
+ * @param {IndexStructure} index
+ * @returns {{ results: Array<{funcId:string, file:string, tier:string, candidateLabel:string|null}>, tier: string }}
+ */
+function queryDeadCode(index) {
+  const testPatterns = getTestPatterns();
+  const results = [];
+
+  for (const [funcId, meta] of index.funcEntities) {
+    // Exclusion 1: entry-point files
+    if (ENTRY_POINT_PATTERNS.some((re) => re.test(meta.file))) continue;
+    // Exclusion 2: test files
+    if (testPatterns.some((re) => re.test(meta.file))) continue;
+    // Exclusion 3: exported public API — function name starts with uppercase
+    if (/^[A-Z]/.test(meta.name)) continue;
+    // Exclusion 4: module.exports patterns
+    if (EXPORTED_FUNC_PATTERNS.some((re) => re.test(meta.name))) continue;
+
+    // Check for inbound call edges
+    const callers = index.callGraph.get(funcId);
+    if (callers && callers.size > 0) continue;
+
+    // Check for inbound import edges (function's file is imported)
+    const fileImporters = index.importGraph.get(meta.file);
+    // If the file is imported, do NOT flag its functions as dead — the file is in use.
+    // (The import itself is the "caller" at the file level.)
+    if (fileImporters && fileImporters.size > 0) continue;
+
+    // This function has no callers AND its file is not imported by anyone.
+    // [RULE] orphan-tier-labeled-candidate-not-certainty:
+    // Floor-tier results are CANDIDATE (a missed unresolved call could explain the absence).
+    const tier = meta.tier || index.tier;
+    const isFloor = tier === "tree-sitter-floor" || tier === "tree-sitter-floor-STALE-SCIP" || tier === SCIP_MISSING_TIER;
+    const candidateLabel = isFloor ? "CANDIDATE" : null;
+
+    results.push({ funcId, file: meta.file, tier, candidateLabel });
+  }
+
+  // Sort deterministically by funcId
+  results.sort((a, b) => (a.funcId < b.funcId ? -1 : 1));
+  return { results, tier: index.tier };
+}
+
+// ─── D9-T2: Query: dangling (edges to missing nodes) ─────────────────────────
+//
+// [RULE] dangling-verb-surfaces-missing-dst
+// A dangling edge: a CALL edge whose dst funcId is NOT in the funcEntities map
+// and is NOT an UNRESOLVED# sentinel (those are expected floor-tier unknowns).
+// IMPORT dangling: an IMPORT edge whose dst file is NOT in allFiles.
+//
+// Consumer: /qa + /verify (dead-code / dangling-ref detection).
+
+/**
+ * dangling: return edges whose dst is a missing node (delete/rename residue).
+ *
+ * @param {IndexStructure} index
+ * @returns {{ results: Array<{src:string, dst:string, kind:string, note:string}>, tier: string }}
+ */
+function queryDangling(index) {
+  const results = [];
+
+  for (const { src, dst, kind } of index.forwardCallEdges) {
+    // Skip UNRESOLVED# sentinels — these are expected at the tree-sitter floor;
+    // they represent unresolvable call targets, NOT deleted/missing nodes.
+    if (dst.startsWith(UNRESOLVED_PREFIX)) continue;
+    // If the dst funcId is not in the entities map, it is a dangling ref
+    if (!index.funcEntities.has(dst)) {
+      results.push({
+        src,
+        dst,
+        kind: "CALL",
+        note: "dst function not in index — possibly deleted or renamed",
+      });
+    }
+  }
+
+  // Also check IMPORT edges: importGraph is reverse (dst → srcs).
+  // To find dangling import dsts, scan all dst keys in importGraph
+  // and check if they are in allFiles.
+  for (const [dst, srcs] of index.importGraph) {
+    if (!index.allFiles.has(dst)) {
+      for (const src of srcs) {
+        results.push({
+          src,
+          dst,
+          kind: "IMPORT",
+          note: "dst file not in index — possibly deleted or renamed",
+        });
+      }
+    }
+  }
+
+  results.sort((a, b) => {
+    const c = a.src < b.src ? -1 : a.src > b.src ? 1 : 0;
+    if (c !== 0) return c;
+    return a.dst < b.dst ? -1 : 1;
+  });
+  return { results, tier: index.tier };
+}
+
+// ─── D9-T3: Query: test-impl (test→impl coverage from call-site edges) ───────
+//
+// [RULE] test-impl-verb-from-call-site-edges-no-new-type
+// [RULE] test-impl-no-new-edge-type-needed
+// [RULE] test-impl-never-presents-unresolved-as-coverage
+//
+// The extractor already emits call-site edges keyed file#function@LINE at both ends.
+// A test→impl edge is DERIVABLE by filtering call edges where src file matches a
+// test-path pattern. NO new edge type is added to D3.
+//
+// Consumers: /test-sync (align tests with impl via coverage edges).
+
+/**
+ * test-impl: return, per test function, the impl funcIds it calls.
+ *
+ * @param {IndexStructure} index
+ * @param {{ inverse?: boolean, testPatterns?: RegExp[] }} [options]
+ *   inverse: if true, return impl funcs with NO test-file caller (untested-impl)
+ * @returns {{ results: Array<{testFunc:string, implFuncs:string[]}> |
+ *             Array<{funcId:string, file:string}>, tier: string, mode: string }}
+ */
+function queryTestImpl(index, options) {
+  const { inverse = false, testPatterns = getTestPatterns() } = options || {};
+
+  if (!inverse) {
+    // Forward mode: for each test function, list the impl funcIds it calls.
+    // [RULE] test-impl-never-presents-unresolved-as-coverage:
+    //   UNRESOLVED# targets are filtered out — they are NOT coverage.
+    /** @type {Map<string, string[]>} */
+    const testToImpl = new Map();
+
+    for (const { src, dst } of index.forwardCallEdges) {
+      // src must be a test file
+      if (!isTestFile(src, testPatterns)) continue;
+      // dst must NOT be a test file (it's an impl target)
+      if (isTestFile(dst, testPatterns)) continue;
+      // dst must NOT be an UNRESOLVED sentinel
+      if (dst.startsWith(UNRESOLVED_PREFIX)) continue;
+
+      if (!testToImpl.has(src)) testToImpl.set(src, []);
+      testToImpl.get(src).push(dst);
+    }
+
+    // Deduplicate and sort implFuncs for each test function
+    const results = [];
+    for (const [testFunc, implFuncs] of testToImpl) {
+      const unique = Array.from(new Set(implFuncs)).sort();
+      results.push({ testFunc, implFuncs: unique });
+    }
+    results.sort((a, b) => (a.testFunc < b.testFunc ? -1 : 1));
+    return { results, tier: index.tier, mode: "forward" };
+  }
+
+  // Inverse mode: impl funcs with NO test-file caller (untested-impl).
+  // Collect all impl funcIds that have at least one test caller.
+  const testedFuncIds = new Set();
+  for (const { src, dst } of index.forwardCallEdges) {
+    if (!isTestFile(src, testPatterns)) continue;
+    if (isTestFile(dst, testPatterns)) continue;
+    if (dst.startsWith(UNRESOLVED_PREFIX)) continue;
+    testedFuncIds.add(dst);
+  }
+
+  const untested = [];
+  for (const [funcId, meta] of index.funcEntities) {
+    // Only consider impl files (not test files)
+    if (isTestFile(funcId, testPatterns)) continue;
+    if (!testedFuncIds.has(funcId)) {
+      untested.push({ funcId, file: meta.file });
+    }
+  }
+  untested.sort((a, b) => (a.funcId < b.funcId ? -1 : 1));
+  return { results: untested, tier: index.tier, mode: "untested-impl" };
+}
+
+// ─── Incomplete-empty marker (read by the M117 search guard) ──────────────────
+//
+// The search guard runs BEFORE a grep and cannot see what the graph just said.
+// When who-calls / blast-radius answers [] with coverage incomplete, record it,
+// so the guard's block message can name a path forward (the files to open, the
+// re-index) instead of leaving none. A write failure is said on stderr.
+// [RULE] incomplete-empty-answer-names-a-path-forward
+
+const INCOMPLETE_MARKER_NAME = "last-incomplete-answer.json";
+
+function writeIncompleteAnswerMarker(projectRoot, verb, target, coverage) {
+  const file = path.join(projectRoot, ".gsd-t", "graphDB", INCOMPLETE_MARKER_NAME);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({
+      ts: new Date().toISOString(),
+      verb,
+      target,
+      note: coverage.note || null,
+      unresolvedCallSites: coverage.unresolvedCallSites || null,
+    }, null, 2));
+  } catch (e) {
+    process.stderr.write("[graph] could not record the incomplete answer for the search guard (" + e.message + ")\n");
+  }
+}
+
+// ─── Public API (for tests to import directly) ────────────────────────────────
+// Tests build an index from fixture records, then call these pure functions.
+// The query CLI is the only caller of runFreshnessCheck (integration seam).
+
+/**
+ * Build an IndexStructure from an array of store records.
+ * Used by tests to construct fixture-based indices without disk I/O.
+ *
+ * @param {object[]} records
+ * @param {Set<string>} [skippedFiles]  — optional skipped-file set for T5 coverage tests
+ */
+function buildIndexFromRecords(records, skippedFiles) {
+  return buildIndex(records, skippedFiles);
+}
+
+module.exports = {
+  buildIndexFromRecords,
+  queryWhoImports,
+  queryWhoCalls,
+  queryBody,
+  queryBlastRadius,
+  queryStatus,
+  queryTable,
+  queryWhoUses,
+  resolveTable,
+  suggestExcludes,
+  // D9 additions
+  queryCluster,
+  queryDeadCode,
+  queryDangling,
+  queryTestImpl,
+  computeCoverage,
+  countUnresolvedFiles,
+  loadStore,
+  runFreshnessCheck,
+  resolveStorePath,
+  // Exported for fault-injection tests
+  loadFreshnessModule,
+  // Exported constants for test assertions
+  COUPLING_THRESHOLD,
+  DEFAULT_TEST_PATTERNS,
+  UNRESOLVED_PREFIX,
+  SCIP_MISSING_TIER,
+  unresolvedCallSitesFor,
+  writeIncompleteAnswerMarker,
+  INCOMPLETE_MARKER_NAME,
+  getTestPatterns,
+  isTestFile,
+};
+
+// ─── CLI entry point ───────────────────────────────────────────────────────────
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  const verb = args[0];
+  const target = args[1];
+
+  // ─── Graph usage telemetry (M99, layer 1) ─────────────────────────────────
+  // Every graph read funnels through emit(); append ONE JSON line per query via
+  // the resolver's append_ledger_line to graphDB/logs/graph-events-NNN.jsonl so
+  // graph usage + health is observable (hit/miss/graph-unavailable, tier, latency,
+  // reindex). This is the chokepoint: one ledger captures 100% of graph reads
+  // regardless of consumer. (M99 moved the sink here from the retired
+  // .gsd-t/metrics/graph-events.jsonl path — see gsd-t-graph-store-resolver.cjs.)
+  // FAIL-OPEN — a telemetry write must NEVER block or alter a query answer.
+  // Consumer label comes from GSDT_GRAPH_CONSUMER (set by the calling workflow/hook);
+  // defaults to "cli" for a bare invocation. [RULE] graph-telemetry-fail-open
+  const _t0 = Date.now();
+  let _telemStorePath = null; // set when storePath resolves; avoids const TDZ in the logger
+  let _telemFreshness = null; // { reindexedCount, staleOnQuery, addsCount, deletesCount, reindexedFiles }
+  // ─── Layer-1 sink: moved to graphDB/logs/ via the M99 resolver sink ──────────
+  // Record SHAPE is KEPT byte-for-byte (kind:"query" + all fields from graph-metrics-contract.md).
+  // Only the sink path + rotation/toggle is the supersede (no Divergence flag).
+  // [RULE] layer1-shape-kept  [RULE] fail-open-telemetry
+  function _logGraphEvent(envelope) {
+    try {
+      const sp = (typeof _telemStorePath === "string" && _telemStorePath) ? _telemStorePath : null;
+      // Derive projectRoot via the resolver (branch-aware). If no storePath yet, use cwd.
+      const projRoot = sp ? _resolver.deriveProjectRoot(sp) : process.cwd();
+      const e = envelope || {};
+      const outcome = e.ok
+        ? (Array.isArray(e.results) && e.results.length === 0 ? "hit-empty" : "hit")
+        : (e.reason || "error");
+      const rec = {
+        kind: "query",
+        ts: new Date().toISOString(),
+        verb: verb || null,
+        target: target || null,
+        outcome,
+        tier: e.tier || null,
+        resultCount: Array.isArray(e.results) ? e.results.length
+          : (typeof e.fileCount === "number" ? e.fileCount : null),
+        candidateCount: Array.isArray(e.candidates) ? e.candidates.length : null,
+        latencyMs: Date.now() - _t0,
+        consumer: process.env.GSDT_GRAPH_CONSUMER || "cli",
+        via: process.env.GSDT_GRAPH_VIA || null,
+        // Freshness signal: did this query run against code that had changed?
+        // reindexedCount>0 ⇒ a STALE query that was auto-refreshed before answering.
+        staleOnQuery: _telemFreshness ? _telemFreshness.staleOnQuery : null,
+        reindexedCount: _telemFreshness ? _telemFreshness.reindexedCount : null,
+        addsCount: _telemFreshness ? _telemFreshness.addsCount : null,
+        deletesCount: _telemFreshness ? _telemFreshness.deletesCount : null,
+        reindexedFiles: (_telemFreshness && _telemFreshness.reindexedCount) ? _telemFreshness.reindexedFiles : null,
+      };
+      // Delegate to the shared sink (graphDB/logs/ + rotation + GSDT_GRAPH_TELEMETRY toggle)
+      _resolver.append_ledger_line(rec, projRoot);
+    } catch { /* fail-open: telemetry never blocks a query */ }
+  }
+
+  function emit(envelope) {
+    _logGraphEvent(envelope);
+    process.stdout.write(JSON.stringify(envelope) + "\n");
+  }
+
+  function fail(envelope) {
+    emit(envelope);
+    process.exit(1);
+  }
+
+  const ALL_VERBS = [
+    "who-imports", "who-calls", "body", "blast-radius", "status",
+    "cluster", "dead-code", "orphan", "dangling", "test-impl",
+    "who-uses", "table",
+  ];
+
+  if (!verb) {
+    fail({ ok: false, reason: "no-verb", usage: `gsd-t graph <${ALL_VERBS.join("|")}> [target]` });
+  }
+
+  if (!ALL_VERBS.includes(verb)) {
+    fail({ ok: false, reason: "unknown-verb", verb });
+  }
+
+  const storePath = resolveStorePath();
+  _telemStorePath = storePath;
+
+  // ── Step 1: D4 freshness check INLINE — [RULE] stale-file-reindexed-before-answer ──
+  const freshnessResult = runFreshnessCheck(storePath);
+  // Capture freshness telemetry: how many files were stale + re-indexed on THIS query.
+  // This is the "freshness reindexing on code updates" + "stale query" signal — a query
+  // that triggered a re-index means the caller queried against code that had changed.
+  try {
+    const r = freshnessResult || {};
+    _telemFreshness = {
+      reindexedCount: typeof r.editsCount === "number" ? r.editsCount : 0,
+      staleOnQuery: (typeof r.editsCount === "number" ? r.editsCount : 0) > 0,
+      addsCount: typeof r.addsCount === "number" ? r.addsCount : 0,
+      deletesCount: typeof r.deletesCount === "number" ? r.deletesCount : 0,
+      reindexedFiles: Array.isArray(r.reindexedFiles) ? r.reindexedFiles : [],
+    };
+  } catch { /* fail-open */ }
+  if (!freshnessResult.ok) {
+    // Propagate the granular reason (graph-absent / graph-broken) so the consumer's
+    // classifier can route ABSENT→auto-build vs BROKEN→HALT. Never collapse to a
+    // single "graph-unavailable" here. [RULE] one-availability-classifier
+    fail({ ok: false, reason: freshnessResult.reason || "graph-broken", detail: freshnessResult.detail });
+  }
+
+  // ── Step 2: Load store (fail-loud if missing or corrupt) ──
+  const storeResult = loadStore(storePath);
+  if (!storeResult.ok) {
+    fail({ ok: false, reason: storeResult.reason || "graph-broken", detail: storeResult.detail });
+  }
+
+  const index = storeResult.index;
+
+  // ── Step 3: Dispatch verb ──
+  if (verb === "who-imports") {
+    if (!target) fail({ ok: false, reason: "missing-target", verb });
+    const { results, tier, coverage } = queryWhoImports(index, target);
+    emit({ ok: true, verb, target, results, tier, coverage });
+
+  } else if (verb === "who-calls") {
+    if (!target) fail({ ok: false, reason: "missing-target", verb });
+    const queryResult = queryWhoCalls(index, target);
+    if (queryResult.ambiguous) {
+      // [RULE] who-calls-function-identity-disambiguated
+      emit({
+        ok: false,
+        reason: "ambiguous-function",
+        verb,
+        target,
+        candidates: queryResult.candidates,
+      });
+      process.exit(2);
+    }
+    if (queryResult.results.length === 0 && queryResult.coverage && queryResult.coverage.complete === false) {
+      writeIncompleteAnswerMarker(_resolver.deriveProjectRoot(storePath), verb, target, queryResult.coverage);
+    }
+    const env = { ok: true, verb, target, results: queryResult.results, tier: queryResult.tier, coverage: queryResult.coverage };
+    if (queryResult.nameMatched) env.nameMatched = queryResult.nameMatched; // [RULE] unique-name-unresolved-call-name-matched
+    if (queryResult.hint) env.hint = queryResult.hint; // a table name asked of who-calls
+    emit(env);
+
+  } else if (verb === "body") {
+    if (!target) fail({ ok: false, reason: "missing-target", verb });
+    // [RULE] projectroot-depth-corrected-with-move — resolver is branch-aware
+    const projectRoot = _resolver.deriveProjectRoot(storePath);
+    let bodyResult = queryBody(index, target, projectRoot);
+
+    // [RULE] body-end-line-required — a pre-M98 node lacks end_line and its file
+    // wasn't stale (so Step-1 freshness didn't re-index it). Re-index that ONE file
+    // inline to populate end_line, reload, retry. Never guess an end.
+    // [RULE] body-reindex-preserves-tier — pass the file's EXISTING tier as
+    // existingTier so this read-path re-index does NOT silently downgrade a
+    // compiler-accurate file to tree-sitter-floor (parse_and_put without SCIP would).
+    if (bodyResult.needsReindex && bodyResult.file) {
+      try {
+        const { parse_and_put } = require(path.join(__dirname, "gsd-t-graph-index.cjs"));
+        const { openDb } = loadFreshnessModule() || {};
+        const absFile = path.isAbsolute(bodyResult.file) ? bodyResult.file : path.join(projectRoot, bodyResult.file);
+        const db = typeof openDb === "function" ? openDb(projectRoot, storePath) : null;
+        if (db && parse_and_put) {
+          // Read the file's stored tier so it is preserved through the re-index.
+          let existingTier = null;
+          try {
+            const row = db.prepare("SELECT tier FROM files WHERE file = ?").get(bodyResult.file);
+            existingTier = row ? row.tier : null;
+          } catch { /* tier preservation is best-effort */ }
+          try {
+            parse_and_put(absFile, bodyResult.file, { db, existingTier });
+          } finally {
+            try { db.close(); } catch {}
+          }
+          const reloaded = loadStore(storePath);
+          if (reloaded.ok) bodyResult = queryBody(reloaded.index, target, projectRoot);
+        }
+      } catch (_e) { /* fall through to the needsReindex envelope below */ }
+    }
+
+    if (bodyResult.ambiguous) {
+      // [RULE] body-ambiguous-never-merged
+      emit({ ok: false, reason: "ambiguous-function", verb, target, candidates: bodyResult.candidates });
+      process.exit(2);
+    }
+    if (bodyResult.notFound) fail({ ok: false, reason: "not-found", verb, target, file: bodyResult.file });
+    if (bodyResult.needsReindex) fail({ ok: false, reason: "end-line-unavailable", verb, target, file: bodyResult.file });
+    emit({
+      ok: true, verb, target: bodyResult.funcId, file: bodyResult.file,
+      lineRange: bodyResult.lineRange, tier: bodyResult.tier,
+      imports: bodyResult.imports, classHeader: bodyResult.classHeader,
+      source: bodyResult.source, callers: bodyResult.callers,
+      ...(bodyResult.table ? { table: bodyResult.table } : {}),
+    });
+
+  } else if (verb === "blast-radius") {
+    if (!target) fail({ ok: false, reason: "missing-target", verb });
+    const br = queryBlastRadius(index, target);
+    if (br.ambiguous) {
+      emit({ ok: false, reason: "ambiguous-table", verb, target, candidates: br.candidates });
+      process.exit(2);
+    }
+    if (br.table) {
+      emit({ ok: true, verb, target, results: br.results, table: br.table, referencingTables: br.referencingTables, users: br.users, tier: br.tier, coverage: br.coverage });
+      process.exit(0);
+    }
+    const { results, tier, coverage, nameMatched } = br;
+    if (results.length === 0 && coverage && coverage.complete === false) {
+      writeIncompleteAnswerMarker(_resolver.deriveProjectRoot(storePath), verb, target, coverage);
+    }
+    const env = { ok: true, verb, target, results, tier, coverage };
+    if (nameMatched) env.nameMatched = nameMatched; // [RULE] unique-name-unresolved-call-name-matched
+    emit(env);
+
+  } else if (verb === "status") {
+    const statusData = queryStatus(index, storePath);
+    // Name the project exclude list so a missing folder is never a mystery.
+    const ex = require("./gsd-t-graph-exclude.cjs").loadGraphExcludes(_resolver.deriveProjectRoot(storePath));
+    emit({ ok: true, verb: "status", ...statusData, excludes: { source: ex.source, patterns: ex.patterns, defaults: ex.defaults } });
+
+  } else if (verb === "who-uses" || verb === "table") {
+    // [RULE] table-not-indexed-distinct-from-no-users — not-found (reason + detail)
+    // is a different envelope from an indexed table with no users (ok, results []).
+    if (!target) fail({ ok: false, reason: "missing-target", verb });
+    const mode = args.includes("--writes") ? "writes" : (args.includes("--reads") ? "reads" : "all");
+    const r = verb === "table" ? queryTable(index, target) : queryWhoUses(index, target, { mode });
+    if (r.ambiguous) {
+      emit({ ok: false, reason: "ambiguous-table", verb, target, candidates: r.candidates });
+      process.exit(2);
+    }
+    if (r.notFound) fail({ ok: false, reason: "not-found", verb, target, detail: r.detail });
+    emit({ ok: true, verb, target, ...r });
+
+  } else if (verb === "cluster") {
+    const { results, tier } = queryCluster(index);
+    emit({ ok: true, verb: "cluster", results, tier });
+
+  } else if (verb === "dead-code" || verb === "orphan") {
+    const { results, tier } = queryDeadCode(index);
+    emit({ ok: true, verb: "dead-code", results, tier });
+
+  } else if (verb === "dangling") {
+    const { results, tier } = queryDangling(index);
+    emit({ ok: true, verb: "dangling", results, tier });
+
+  } else if (verb === "test-impl") {
+    const inverse = args.includes("--inverse");
+    const { results, tier, mode } = queryTestImpl(index, { inverse });
+    emit({ ok: true, verb: "test-impl", mode, results, tier });
+  }
+
+  process.exit(0);
+}

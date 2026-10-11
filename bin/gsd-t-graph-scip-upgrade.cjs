@@ -1,0 +1,667 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * gsd-t-graph-scip-upgrade.cjs
+ *
+ * M94 D3-T3 — Optional SCIP upgrade + accuracy tier labelling.
+ *
+ * Detects per-language SCIP indexers (scip-typescript, scip-python,
+ * rust-analyzer scip) as child-process tools — NEVER as installer deps.
+ * When present: re-derives that language's edges compiler-accurate and
+ * labels tier = "compiler-accurate".
+ * When absent: tier = "tree-sitter-floor" (approximate, never broken).
+ *
+ * [RULE] accuracy-tier-labeled-never-silently-wrong
+ *   Every edge carries its tier. No unlabeled mix.
+ *
+ * [RULE] rust-cross-crate-flagged-partial
+ *   Rust cross-crate edges are FLAGGED partial. Within-crate edges resolve.
+ *   rust-analyzer SCIP is officially "limited" on cross-crate edges.
+ *
+ * [RULE] reindex-tier-never-silently-downgraded (for parse_and_put)
+ *   A previously compiler-accurate file that is re-indexed MUST get EITHER:
+ *     (1) re-upgraded to "compiler-accurate" (SCIP still present + works), OR
+ *     (2) labeled "tree-sitter-floor-STALE-SCIP" (SCIP was present, now absent/fails).
+ *   NEVER silently relabeled as plain "tree-sitter-floor" (loses the "was-accurate"
+ *   signal) or plain "compiler-accurate" over tree-sitter-only edges (claims
+ *   accuracy that was not delivered).
+ *
+ * Exported API:
+ *   tryScipUpgrade(absPath, relPath, entities, edges, { prevTier? })
+ *     → { upgraded: bool, tier, entities, edges }
+ *
+ *   detectScip()
+ *     → { typescript: bool, python: bool, rust: bool }
+ *
+ * The graph NEVER depends on SCIP to FUNCTION — only to get BETTER.
+ * SCIP absent → degrade to tree-sitter-floor (never break).
+ *
+ * SCIP indexers are invoked as child-process one-shot tools, never required
+ * at installer runtime. They must be pre-installed by the user.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { execSync, spawnSync } = require('child_process');
+// Red Team HIGH (M99 round 4 — SC#1): SCIP indexes must live under .gsd-t/graphDB/,
+// not loose in .gsd-t/. Route every index.scip / index-python.scip path through the
+// single resolver. [RULE] scip-index-under-graphdb
+const { resolveScipPath } = require('./gsd-t-graph-store-resolver.cjs');
+
+// ── ANSI helpers ─────────────────────────────────────────────────────────────
+
+const C = {
+  reset: '\x1b[0m',
+  green: '\x1b[32m',
+  red: '\x1b[31m',
+  yellow: '\x1b[33m',
+  cyan: '\x1b[36m',
+};
+function log(msg) { process.stderr.write(msg + '\n'); }
+function info(msg) { log(`${C.cyan}[SCIP]${C.reset} ${msg}`); }
+function warn(msg) { log(`${C.yellow}[SCIP WARN]${C.reset} ${msg}`); }
+function errLog(msg){ log(`${C.red}[SCIP ERR]${C.reset} ${msg}`); }
+
+// ── Extension → language mapping ─────────────────────────────────────────────
+
+const EXT_TO_LANG = {
+  '.ts': 'typescript',
+  '.tsx': 'typescript',
+  '.js': 'typescript',     // scip-typescript handles JS too
+  '.jsx': 'typescript',
+  '.mjs': 'typescript',
+  '.cjs': 'typescript',
+  '.py': 'python',
+  '.rs': 'rust',
+};
+
+// ── Memoized SCIP availability detection ─────────────────────────────────────
+
+let _scipDetected = null;
+
+/**
+ * Detect which SCIP indexers are available on PATH.
+ * Result is memoized for the process lifetime (one-shot detection).
+ *
+ * [RULE] accuracy-tier-labeled-never-silently-wrong: detection is binary —
+ * we do NOT attempt a partial run; if the tool is absent or errors, it's absent.
+ *
+ * @returns {{ typescript: bool, python: bool, rust: bool }}
+ */
+function detectScip() {
+  if (_scipDetected) return _scipDetected;
+
+  function toolExists(cmd) {
+    try {
+      execSync(`which ${cmd}`, { stdio: 'pipe', encoding: 'utf8' });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  _scipDetected = {
+    typescript: toolExists('scip-typescript'),
+    python: toolExists('scip-python'),
+    rust: toolExists('rust-analyzer') && toolExists('scip'),
+  };
+
+  return _scipDetected;
+}
+
+/** Force-reset the detection cache (used by tests to inject mock availability). */
+function _resetScipCache(override) {
+  _scipDetected = override || null;
+}
+
+// ── SCIP invocation ───────────────────────────────────────────────────────────
+
+/**
+ * Run scip-typescript on the project root containing absPath.
+ * Returns { ok: bool, scipOutput?: object, error?: string }
+ *
+ * scip-typescript produces a SCIP protobuf on disk; we only check that it
+ * exits 0 here (full SCIP parse integration is Phase-2 scope — this is the
+ * floor that proves the indexer CAN produce compiler-accurate output).
+ *
+ * For Phase-1 the key semantic output is: the function returned ok=true with
+ * scip-typescript present → the file's tier is labeled compiler-accurate.
+ * The exact edge re-derivation from the SCIP proto is Phase-2.
+ *
+ * NOTE: Phase-1 SCIP upgrade is "tier labelling only" — it re-uses the
+ * tree-sitter edges but labels them compiler-accurate for files where SCIP
+ * is confirmed present and invocable. Phase-2 will replace the edges with
+ * SCIP-derived ones. This is the documented UPGRADE FLOOR behavior.
+ */
+const SCIP_MAX_FILE_BYTES = '64mb';
+const SCIP_HEAP_MB = 8192;
+const SCIP_MISSING_TIER = 'tree-sitter-floor-SCIP-MISSING';
+// A file SCIP indexed but where fewer than this share of its repo-resolvable calls
+// resolved. [RULE] scip-tier-proportional
+const COMPILER_PARTIAL_TIER = 'compiler-partial';
+const COMPILER_ACCURATE_MIN_FRACTION = 0.9;
+
+function runScipTypescript(projectRoot, outPath) {
+  // M95: emit to a REAL file (outPath) so the index can be READ and call edges
+  // resolved — not /dev/null. The old /dev/null path only proved invocability.
+  const out = outPath || resolveScipPath('index.scip', projectRoot);
+  // Ensure the output dir (now .gsd-t/graphDB/) exists — scip-typescript's
+  // --output open() fails if the parent dir is absent (the old .gsd-t/ always
+  // existed; graphDB/ may not on a fresh build). [RULE] scip-index-under-graphdb
+  try { fs.mkdirSync(path.dirname(out), { recursive: true }); } catch {}
+  // --infer-tsconfig: resolve a tsconfig even when one isn't at the repo root
+  // (monorepos / nested layouts — e.g. web/tsconfig.json). Without it, projects
+  // whose tsconfig lives in a subdir got 0 resolved call edges. [RULE] scip-infer-nested-tsconfig
+  // --max-file-byte-size: scip-typescript SKIPS every file over 1mb by default,
+  // silently — no warning, no document in the index. A 50k-line route file
+  // (hilo-figma-atos routes-locations.ts, 1.9MB) was never resolved, so every
+  // call in it stayed unresolved and who-calls answered []. Raise the cap well
+  // past any hand-written source file. [RULE] scip-no-silent-large-file-skip
+  // A larger heap keeps a big project from dying mid-run once those files are in.
+  const nodeOpts = process.env.NODE_OPTIONS || '';
+  const env = /max-old-space-size/.test(nodeOpts)
+    ? process.env
+    : { ...process.env, NODE_OPTIONS: `${nodeOpts} --max-old-space-size=${SCIP_HEAP_MB}`.trim() };
+  const scip = spawnSync('scip-typescript',
+    ['index', '--infer-tsconfig', '--max-file-byte-size', SCIP_MAX_FILE_BYTES, '--output', out, '.'], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    timeout: 180_000,
+    env,
+  });
+  if (scip.status === 0) return { ok: true, scipPath: out };
+  return { ok: false, error: scip.stderr || `exit code ${scip.status}` };
+}
+
+function runScipPython(projectRoot, outPath) {
+  // Emit to a REAL file (separate from the TS index) so it can be READ + merged.
+  // --project-name is required-ish for stable symbols; derive from the dir name.
+  const out = outPath || resolveScipPath('index-python.scip', projectRoot);
+  try { fs.mkdirSync(path.dirname(out), { recursive: true }); } catch {} // graphDB/ may not exist yet
+  const projName = path.basename(projectRoot).replace(/[^A-Za-z0-9_-]/g, '-') || 'project';
+  // scip-python REQUIRES a project version — it crashes (makeModuleInit) when the
+  // version is undefined (no pyproject.toml). Pass an explicit fallback version.
+  const scip = spawnSync('scip-python',
+    ['index', '--project-name', projName, '--project-version', '0.0.0', '--output', out, '.'], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    timeout: 180_000,
+  });
+  if (scip.status === 0) return { ok: true, scipPath: out };
+  return { ok: false, error: scip.stderr || `exit code ${scip.status}` };
+}
+
+// Cheap shallow language detection — does the repo contain TS/JS or Python source
+// (excluding vendored/build dirs)? Used to skip an indexer when its language is
+// absent. Walks at most a bounded depth to stay fast.
+function detectRepoLanguages(repoRoot) {
+  const SKIP = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.venv', 'venv',
+    'site-packages', '__pycache__', '.next', 'coverage', 'Pods', '.dart_tool', 'vendor']);
+  let typescript = false, python = false;
+  function isSkip(name) {
+    if (SKIP.has(name)) return true;
+    return ['dist', 'build', 'out'].some(p => name.length > p.length && name.startsWith(p) &&
+      (name[p.length] === '-' || name[p.length] === '.' || name[p.length] === '_'));
+  }
+  function walk(dir, depth) {
+    if ((typescript && python) || depth > 6) return;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (typescript && python) return;
+      if (e.isDirectory()) { if (!isSkip(e.name)) walk(path.join(dir, e.name), depth + 1); }
+      else if (e.isFile()) {
+        const ext = path.extname(e.name).toLowerCase();
+        if (ext === '.ts' || ext === '.tsx' || ext === '.js' || ext === '.jsx' || ext === '.mjs' || ext === '.cjs') typescript = true;
+        else if (ext === '.py') python = true;
+      }
+    }
+  }
+  walk(repoRoot, 0);
+  return { typescript, python };
+}
+
+function runScipRust(projectRoot) {
+  // rust-analyzer + scip: run `scip` (the rust-analyzer scip bridge) if available
+  // As with TypeScript, Phase-1 is tier-labelling only
+  const scip = spawnSync('scip', ['rust', '--output', '/dev/null'], {
+    cwd: projectRoot,
+    encoding: 'utf8',
+    timeout: 180_000,
+  });
+  if (scip.status === 0) return { ok: true };
+  return { ok: false, error: scip.stderr || `exit code ${scip.status}` };
+}
+
+// ── Cross-crate edge detection (Rust) ─────────────────────────────────────────
+
+/**
+ * Determine if a Rust edge is cross-crate.
+ *
+ * A simple heuristic: if the src and dst funcIds are in different crate roots
+ * (different top-level Cargo.toml directories) → cross-crate.
+ * Phase-1: rely on the "UNRESOLVED#" prefix that tree-sitter emits for
+ * unresolvable call targets — if the target starts with UNRESOLVED# and the
+ * file is .rs, flag it partial.
+ *
+ * [RULE] rust-cross-crate-flagged-partial
+ */
+function isRustCrossCrateEdge(edge, relPath) {
+  if (path.extname(relPath).toLowerCase() !== '.rs') return false;
+  // Phase-1 heuristic: unresolved targets in Rust are cross-crate candidates
+  const dst = edge.dst || edge.target || '';
+  if (dst.startsWith('UNRESOLVED#')) return true;
+  // If src and dst have different top-level directories → cross-crate
+  const srcFile = (edge.src || edge.source || '').split('#')[0];
+  const dstFile = (edge.dst || edge.target || '').split('#')[0];
+  if (srcFile && dstFile) {
+    const srcTop = srcFile.split('/')[0];
+    const dstTop = dstFile.split('/')[0];
+    if (srcTop !== dstTop && srcTop && dstTop) return true;
+  }
+  return false;
+}
+
+// ── TypeScript project discovery (M114) ──────────────────────────────────────
+
+/**
+ * Find every TypeScript project root in the repo — each directory holding a
+ * `tsconfig.json`.
+ *
+ * Why: scip-typescript indexes ONE tsconfig per run, and a tsconfig's `include`
+ * governs what it can see. A repo whose root tsconfig covers only the frontend
+ * indexes only the frontend; `server/src/` is never compiled, so not one backend
+ * call resolves and `who-calls` answers empty for the entire backend.
+ * `--infer-tsconfig` does NOT cover this — it finds *a* tsconfig when the root
+ * has none, but still produces a single index from a single root.
+ *
+ * Returns repo-relative dirs, root first (`''` for the repo root itself), so the
+ * root project's symbols win when two projects define the same name.
+ *
+ * A nested project inside another's `include` gets indexed twice; that is
+ * harmless — the second read overwrites identical keys with identical values.
+ *
+ * [RULE] scip-indexes-every-tsconfig-project
+ *
+ * @param {string} repoRoot
+ * @returns {string[]} repo-relative project dirs, e.g. ['', 'server']
+ */
+function findTsProjectDirs(repoRoot) {
+  const SKIP = new Set(['node_modules', '.git', 'dist', 'build', 'out', '.venv', 'venv',
+    'site-packages', '__pycache__', '.next', 'coverage', 'Pods', '.dart_tool', 'vendor']);
+  function isSkip(name) {
+    if (SKIP.has(name)) return true;
+    return ['dist', 'build', 'out'].some(p => name.length > p.length && name.startsWith(p) &&
+      (name[p.length] === '-' || name[p.length] === '.' || name[p.length] === '_'));
+  }
+  const found = [];
+  function walk(dir, depth) {
+    if (depth > 4) return;               // deep enough for monorepo packages/*/x
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (e.isFile() && e.name === 'tsconfig.json') {
+        const rel = path.relative(repoRoot, dir).split(path.sep).join('/');
+        found.push(rel);
+      }
+    }
+    for (const e of entries) {
+      if (e.isDirectory() && !isSkip(e.name)) walk(path.join(dir, e.name), depth + 1);
+    }
+  }
+  walk(repoRoot, 0);
+  // Root ('') first so its symbols are read before nested ones.
+  found.sort((a, b) => (a === '' ? -1 : b === '' ? 1 : a.localeCompare(b)));
+  return found;
+}
+
+// ── Repo-level SCIP resolver (M95) ────────────────────────────────────────────
+
+/**
+ * Build a repo-wide SCIP resolver ONCE: run scip-typescript over the whole repo,
+ * read the emitted index.scip, and return the resolution maps + a per-file
+ * call-edge resolver. This is the object passed as `scip` into parse_and_put so
+ * each file resolves its UNRESOLVED# call targets against real cross-file data.
+ *
+ * Running SCIP once per repo (not once per file) is the correctness AND
+ * performance fix — the old per-file run re-indexed the whole repo for every
+ * file and never read the output.
+ *
+ * @param {string} repoRoot
+ * @param {{ languages?: { typescript?: bool, python?: bool } }} [opts]
+ * @returns {{ ok: bool, reason?: string, scipPath?: string,
+ *             resolveFileEdges: (relPath, edges) => { edges, resolved: number } }}
+ */
+function buildScipResolver(repoRoot, opts = {}) {
+  const { readScipIndex, scipPositionKey } = require('./gsd-t-scip-reader.cjs');
+  const avail = detectScip();
+
+  // Detect which languages have source present (so we only run the relevant
+  // indexer). Cheap shallow check: does the repo contain .ts/.tsx/.js or .py?
+  const langs = detectRepoLanguages(repoRoot);
+
+  // Run each available+relevant indexer, merge their resolution maps. The reader
+  // is language-agnostic (Python symbols use the same `name().` descriptor form),
+  // so TS and Python refs merge into one fileRefs map keyed by repo-relative path.
+  const fileRefs = new Map(); // relPath → [{symbol, funcId, line}]
+  const scipDocs = new Set(); // every file any indexer produced a document for
+  const defNames = new Set(); // every name SCIP saw DEFINED in the repo — what a call could resolve to
+  const occurrencePositions = new Map(); // relPath → Set<positionKey> of every SCIP occurrence
+  const ranIndexers = [];
+
+  function mergeRead(read) {
+    if (!read || !read.ok) return;
+    if (read.docPaths) for (const d of read.docPaths) scipDocs.add(d);
+    if (read.symbolToDef) for (const fid of read.symbolToDef.values()) defNames.add(fid.split('#').pop());
+    if (read.occurrencePositions) {
+      for (const [f, pos] of read.occurrencePositions) {
+        if (occurrencePositions.has(f)) for (const k of pos) occurrencePositions.get(f).add(k);
+        else occurrencePositions.set(f, pos);
+      }
+    }
+    for (const [file, refs] of read.fileRefs) {
+      if (fileRefs.has(file)) fileRefs.get(file).push(...refs);
+      else fileRefs.set(file, refs.slice());
+    }
+  }
+
+  // TypeScript: one indexer run PER tsconfig project, each re-prefixed back to
+  // repo-root-relative paths before merging. A single root run misses every
+  // nested project (see findTsProjectDirs), and a second run without the prefix
+  // resolves nothing — both halves are required for either to work.
+  const tsProjects = [];
+  if (avail.typescript && langs.typescript) {
+    const dirs = findTsProjectDirs(repoRoot);
+    // No tsconfig anywhere → one root run with --infer-tsconfig (prior behavior).
+    const targets = dirs.length ? dirs : [''];
+    for (const rel of targets) {
+      const absRoot = rel ? path.join(repoRoot, rel) : repoRoot;
+      // One .scip per project — a shared filename would have each run clobber
+      // the last, leaving only the final project's symbols.
+      const outName = rel ? `index-ts-${rel.replace(/[^A-Za-z0-9_-]/g, '-')}.scip` : 'index.scip';
+      try {
+        const run = runScipTypescript(absRoot, resolveScipPath(outName, repoRoot));
+        if (run && run.ok) {
+          const read = readScipIndex(run.scipPath, rel);
+          if (read && read.ok) {
+            mergeRead(read);
+            tsProjects.push({ dir: rel || '.', files: read.fileRefs.size });
+          }
+        }
+      } catch { /* this project degrades to floor; others still contribute */ }
+    }
+    if (tsProjects.length) ranIndexers.push('typescript');
+  }
+  if (avail.python && langs.python) {
+    try {
+      const run = runScipPython(repoRoot, resolveScipPath('index-python.scip', repoRoot));
+      if (run && run.ok) { mergeRead(readScipIndex(run.scipPath)); ranIndexers.push('python'); }
+    } catch { /* degrade to floor for Python */ }
+  }
+
+  if (!ranIndexers.length) {
+    // No applicable indexer present/ran → floor mode.
+    const reason = (!avail.typescript && !avail.python) ? 'scip-indexers-absent'
+      : (!langs.typescript && !langs.python) ? 'no-indexable-source'
+      : 'scip-run-failed';
+    return { ok: false, reason, resolveFileEdges: passthroughResolver };
+  }
+
+  /**
+   * Resolve a single file's call edges. For each CALL edge whose dst is
+   * UNRESOLVED#<name>, if SCIP found a reference to <name> in this file that
+   * resolves to a real funcId, rewrite dst to that funcId.
+   */
+  function resolveFileEdges(relPath, edges) {
+    const refs = fileRefs.get(relPath) || [];
+
+    // name → resolved funcId (last writer wins; SCIP refs in this file)
+    const nameToFuncId = new Map();
+    for (const r of refs) {
+      const name = r.funcId.includes('#') ? r.funcId.split('#')[1] : r.funcId;
+      nameToFuncId.set(name, r.funcId);
+    }
+
+    let resolved = 0;
+    // missed = a call to a name the repo defines, at a position where SCIP put NO
+    // symbol — the compiler never looked at it. A call SCIP resolved to a library
+    // (drizzle's `text()`) or a local (`const [x, setX] = useState()`) is not a
+    // miss: SCIP answered, the answer just is not a repo function.
+    const positions = occurrencePositions.get(relPath);
+    let missed = 0;
+    const out = edges.map((edge) => {
+      const dst = edge.target || edge.dst || '';
+      const kind = edge.kind;
+      const isCall = kind === 'call-site' || kind === 'CALL';
+      if (!isCall || !dst.startsWith('UNRESOLVED#')) return edge;
+      const calleeName = dst.slice('UNRESOLVED#'.length);
+      const funcId = nameToFuncId.get(calleeName);
+      if (!funcId) { // still unresolved → stays floor
+        const seen = positions && Number.isInteger(edge.col) && positions.has(scipPositionKey(edge.line - 1, edge.col));
+        if (defNames.has(calleeName) && !seen) missed++;
+        return edge;
+      }
+      resolved++;
+      // rewrite dst to the resolved funcId, mark scip-derived
+      return { ...edge, target: funcId, dst: funcId, scipResolved: true };
+    });
+    // resolvable = resolved + missed. A call to a library (`c.json`) or a local
+    // never counts against the file. [RULE] scip-tier-proportional
+    return { edges: out, resolved, resolvable: resolved + missed };
+  }
+
+  // tsProjects reports which tsconfig projects actually contributed refs. A
+  // project that ran but yielded 0 files is the signature of this bug class —
+  // surfaced rather than swallowed, so a re-index can be inspected.
+  return {
+    ok: true,
+    indexers: ranIndexers,
+    tsProjects,
+    indexedFiles: fileRefs.size,
+    scipPath: resolveScipPath('index.scip', repoRoot),
+    resolveFileEdges,
+    // [RULE] scip-missing-file-detected-never-silent — lets the upgrader tell a
+    // file the indexer never produced a document for from one it indexed.
+    coversLanguage: (lang) => ranIndexers.includes(lang),
+    hasScipDoc: (relPath) => scipDocs.has(relPath),
+  };
+}
+
+/** No-op resolver used when SCIP is unavailable (floor mode). */
+function passthroughResolver(relPath, edges) {
+  return { edges, resolved: 0 };
+}
+
+// ── Main upgrade function ─────────────────────────────────────────────────────
+
+/**
+ * Try to upgrade a file's entities + edges to compiler-accurate tier via SCIP.
+ *
+ * M95: "upgrade" now RESOLVES call edges from real SCIP output. A file is labeled
+ * compiler-accurate only when SCIP data was actually applied (resolver present);
+ * edges that stay UNRESOLVED keep floor semantics. Rust cross-crate edges are
+ * flagged partial regardless.
+ *
+ * [RULE] reindex-tier-never-silently-downgraded:
+ *   prevTier: the tier currently recorded in the store for this file.
+ *   - If prevTier == 'compiler-accurate' and SCIP is still present → re-upgrade → 'compiler-accurate'
+ *   - If prevTier == 'compiler-accurate' and SCIP is now absent/fails → 'tree-sitter-floor-STALE-SCIP'
+ *   - If prevTier != 'compiler-accurate' and SCIP present → 'compiler-accurate'
+ *   - If prevTier != 'compiler-accurate' and SCIP absent → 'tree-sitter-floor'
+ *
+ * @param {string}   absPath   - absolute path to the file
+ * @param {string}   relPath   - repo-relative POSIX path
+ * @param {Array}    entities  - from tree-sitter floor extraction
+ * @param {Array}    edges     - from tree-sitter floor extraction
+ * @param {{ prevTier?: string, projectRoot?: string }} options
+ * @returns {{ upgraded: boolean, tier: string, entities: Array, edges: Array }}
+ */
+function tryScipUpgrade(absPath, relPath, entities, edges, options) {
+  const { prevTier = null, projectRoot = null } = options || {};
+  const ext = path.extname(absPath).toLowerCase();
+  const lang = EXT_TO_LANG[ext];
+
+  if (!lang) {
+    // Unsupported language — no upgrade possible
+    const tier = prevTier === 'compiler-accurate' ? 'tree-sitter-floor-STALE-SCIP' : 'tree-sitter-floor';
+    return { upgraded: false, tier, entities, edges };
+  }
+
+  const avail = detectScip();
+
+  // Determine if SCIP is available for this language
+  let scipPresent = false;
+  if (lang === 'typescript') scipPresent = avail.typescript;
+  if (lang === 'python')     scipPresent = avail.python;
+  if (lang === 'rust')       scipPresent = avail.rust;
+
+  if (!scipPresent) {
+    // [RULE] reindex-tier-never-silently-downgraded
+    // If a previously compiler-accurate file loses SCIP, label STALE-SCIP
+    const tier = prevTier === 'compiler-accurate'
+      ? 'tree-sitter-floor-STALE-SCIP'
+      : 'tree-sitter-floor';
+    return { upgraded: false, tier, entities, edges };
+  }
+
+  // M95: resolve call edges from the REPO-LEVEL SCIP resolver built once by
+  // build_index and threaded through options.resolver. We NEVER re-run SCIP per
+  // file here (the old per-file run re-indexed the whole repo for every file and
+  // discarded the output). If no resolver was provided, we cannot resolve —
+  // stay floor (honest), never relabel.
+  const resolver = options.resolver || null;
+  if (!resolver || typeof resolver.resolveFileEdges !== 'function') {
+    const tier = prevTier === 'compiler-accurate'
+      ? 'tree-sitter-floor-STALE-SCIP'
+      : 'tree-sitter-floor';
+    return { upgraded: false, tier, entities, edges };
+  }
+
+  // The indexer ran for this language but produced no document for this file
+  // (skipped for size, outside every tsconfig, or dropped mid-run). Its call
+  // targets are unknown — say so in the tier, never label it plain floor or,
+  // worse, compiler-accurate. [RULE] scip-missing-file-detected-never-silent
+  if (typeof resolver.hasScipDoc === 'function' && typeof resolver.coversLanguage === 'function' &&
+      resolver.coversLanguage(lang) && !resolver.hasScipDoc(relPath)) {
+    return { upgraded: false, tier: SCIP_MISSING_TIER, entities, edges };
+  }
+
+  // Resolve this file's UNRESOLVED# call edges against the SCIP index.
+  const { edges: resolvedEdges, resolved, resolvable = 0 } = resolver.resolveFileEdges(relPath, edges);
+
+  // Rust cross-crate edges stay flagged partial.
+  // [RULE] rust-cross-crate-flagged-partial
+  const finalEdges = resolvedEdges.map(edge => {
+    if (lang === 'rust' && isRustCrossCrateEdge(edge, relPath)) {
+      return { ...edge, partial: true };
+    }
+    return edge;
+  });
+
+  // [RULE] scip-tier-honest: label compiler-accurate ONLY when SCIP actually
+  // resolved enough edges (proportionally). A file whose calls all stayed
+  // UNRESOLVED is NOT compiler-accurate — it's floor.
+  // [RULE] scip-tier-proportional: the fraction of resolvable calls that actually
+  // resolved determines the tier. If ≥COMPILER_ACCURATE_MIN_FRACTION resolved,
+  // it's accurate; otherwise partial (still better than floor). A file with no
+  // resolvable edges (only locals/library calls) that SCIP indexed cleanly
+  // is compiler-accurate. [ISSUE] user reported: routes-locations.ts 80% UNRESOLVED
+  // yet labeled compiler-accurate because ONE edge resolved.
+  const hadCallEdges = edges.some(e => (e.kind === 'call-site' || e.kind === 'CALL'));
+  let tier = 'tree-sitter-floor';
+  if (!hadCallEdges) {
+    // Pure-definition file SCIP indexed cleanly → compiler-accurate
+    tier = 'compiler-accurate';
+  } else if (resolvable > 0) {
+    // File has resolvable calls — judge by proportion resolved
+    if (resolved / resolvable >= COMPILER_ACCURATE_MIN_FRACTION) {
+      // Enough resolvable calls resolved → accurate
+      tier = 'compiler-accurate';
+    } else if (resolved > 0) {
+      // Some but not enough resolvable calls resolved → partial
+      tier = COMPILER_PARTIAL_TIER;
+    }
+    // else: no edges resolved (0/resolvable) → tree-sitter-floor (default)
+  }
+  // else: no resolvable calls (all external/local) — stay tree-sitter-floor (default)
+
+  const upgraded = tier === 'compiler-accurate';
+
+  return {
+    upgraded,
+    tier,
+    entities,
+    edges: finalEdges,
+  };
+}
+
+// ── CLI entry point ───────────────────────────────────────────────────────────
+
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  const cmd = args[0] || 'detect';
+
+  if (cmd === 'detect') {
+    const avail = detectScip();
+    const envelope = {
+      ok: true,
+      cmd: 'detect',
+      scip: avail,
+    };
+    console.log(JSON.stringify(envelope, null, 2));
+    process.exit(0);
+  }
+
+  if (cmd === 'upgrade') {
+    const fileArg = args[1];
+    const rootIdx = args.indexOf('--repo-root');
+    const prevTierIdx = args.indexOf('--prev-tier');
+    const repoRoot = rootIdx !== -1 ? args[rootIdx + 1] : process.cwd();
+    const prevTier = prevTierIdx !== -1 ? args[prevTierIdx + 1] : null;
+
+    if (!fileArg || !fs.existsSync(fileArg)) {
+      errLog(`File not found: ${fileArg}`);
+      process.exit(1);
+    }
+
+    const { extractEdges } = require('./gsd-t-graph-edge-extract.cjs');
+    const absPath = path.resolve(fileArg);
+    const relPath = path.relative(repoRoot, absPath).split(path.sep).join('/');
+
+    const { entities, edges } = extractEdges(absPath, relPath);
+    const result = tryScipUpgrade(absPath, relPath, entities, edges, {
+      prevTier,
+      projectRoot: repoRoot,
+    });
+
+    const envelope = {
+      ok: true,
+      cmd: 'upgrade',
+      file: relPath,
+      tier: result.tier,
+      upgraded: result.upgraded,
+      entityCount: result.entities.length,
+      edgeCount: result.edges.length,
+    };
+    console.log(JSON.stringify(envelope, null, 2));
+    process.exit(0);
+  }
+
+  errLog(`Unknown command: ${cmd}. Use: detect | upgrade <file>`);
+  process.exit(1);
+}
+
+module.exports = {
+  tryScipUpgrade,
+  buildScipResolver,
+  findTsProjectDirs,
+  detectScip,
+  _resetScipCache,
+  isRustCrossCrateEdge,
+  EXT_TO_LANG,
+  SCIP_MISSING_TIER,
+  SCIP_MAX_FILE_BYTES,
+  COMPILER_PARTIAL_TIER,
+  COMPILER_ACCURATE_MIN_FRACTION,
+};

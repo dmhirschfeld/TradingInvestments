@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+.venv/
+__pycache__/
+
+# Build output
+dist/
+build/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.local
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# GSD-T ephemera (per-session / runtime, not committed)
+.gsd-t/briefs/
+.gsd-t/events/
+.gsd-t/transcripts/
+.gsd-t/metrics/
+.gsd-t/heartbeat-*.jsonl
+.gsd-t/graphDB/
+.gsd-t/verify-gate/
+
+# GSD-T logging stores (local SQLite — runtime data)
+.gsd-t/trace.db
+.gsd-t/audit.db
+.claude/scheduled_tasks.lock
+
+# GSD-T retired-file backups
+.gsd-t/retired/

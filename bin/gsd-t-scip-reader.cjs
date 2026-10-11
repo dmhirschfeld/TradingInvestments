@@ -1,0 +1,251 @@
+/**
+ * gsd-t-scip-reader.cjs
+ *
+ * M95 — Read a SCIP index (`index.scip`, a protobuf emitted by scip-typescript /
+ * scip-python) and turn it into the data the graph needs to RESOLVE call edges:
+ *
+ *   1. symbolToDef : Map<scipSymbol, funcId>      — where each symbol is DEFINED
+ *   2. fileRefs    : Map<relPath, Array<{symbol, funcId, line}>>  — every
+ *      reference occurrence in that file, already resolved to the def funcId
+ *
+ * A funcId is the graph's canonical `relPath#funcName` (line-suffix dropped here;
+ * the indexer keys call edges on `relPath#name`-style ids — see resolveCallEdges).
+ *
+ * Why this exists: before M95 the SCIP "upgrade" only RAN scip-typescript and
+ * relabelled the tree-sitter edges 'compiler-accurate' without reading the output.
+ * This module reads the output so call targets actually resolve across files.
+ *
+ * The SCIP protobuf decoder is the one bundled inside scip-typescript
+ * (`dist/src/scip.js`). scip-typescript is a GSD-T install requirement (M95), so
+ * depending on its bundled decoder is legitimate. We locate it across install
+ * layouts and FAIL LOUD if absent (never silently degrade).
+ *
+ * [RULE] scip-resolution-reads-real-output  — edges are derived from the .scip
+ *        protobuf, never relabelled-in-place.
+ * [RULE] scip-symbol-to-funcid-deterministic — same .scip → same funcId map.
+ */
+
+'use strict';
+
+const fs = require('node:fs');
+const path = require('node:path');
+const { execSync } = require('node:child_process');
+
+// ── Locate scip-typescript's bundled SCIP protobuf decoder ───────────────────
+let _scipProto = null;
+
+/**
+ * Load the bundled `scip.js` protobuf namespace from scip-typescript.
+ * Searches: local node_modules → global npm root → NODE_PATH.
+ * @returns {object|null} the `scip` namespace (Index, Document, …) or null.
+ */
+function loadScipProto() {
+  if (_scipProto) return _scipProto;
+
+  const candidates = [];
+  // 1. local node_modules (if scip-typescript is a project dep)
+  try {
+    candidates.push(require.resolve('@sourcegraph/scip-typescript/dist/src/scip.js'));
+  } catch { /* not local */ }
+  // 2. global npm root
+  try {
+    const groot = execSync('npm root -g', { encoding: 'utf8' }).trim();
+    candidates.push(path.join(groot, '@sourcegraph/scip-typescript/dist/src/scip.js'));
+  } catch { /* npm not reachable */ }
+
+  for (const c of candidates) {
+    try {
+      if (fs.existsSync(c)) {
+        const mod = require(c);
+        _scipProto = mod.scip || mod;
+        if (_scipProto && _scipProto.Index) return _scipProto;
+      }
+    } catch { /* try next */ }
+  }
+  return null;
+}
+
+// ── SCIP symbol → function name ──────────────────────────────────────────────
+// A SCIP symbol looks like:
+//   "scip-typescript npm <pkg> <ver> src/`calc.ts`/computeTotal()."
+// The trailing descriptor after the last '/' identifies the entity:
+//   "computeTotal()."  → a method/function descriptor (ends with "().")
+//   "computeTotal()(x)" → a parameter (we ignore params for call resolution)
+// We extract the bare name from a function/method descriptor.
+
+/**
+ * Extract the function name from a SCIP symbol, or null if the symbol is not a
+ * callable (parameter, type, module, etc.).
+ * @param {string} symbol
+ * @returns {string|null}
+ */
+function funcNameFromSymbol(symbol) {
+  if (!symbol || typeof symbol !== 'string') return null;
+
+  // The name is the last descriptor segment. Top-level functions are
+  // ".../`file.ts`/name()."; methods are ".../`file.ts`/Class#method()." — so the
+  // name follows the LAST '/' OR '#', whichever is later (methods key on '#').
+  const cut = Math.max(symbol.lastIndexOf('/'), symbol.lastIndexOf('#'));
+  const descriptor = cut === -1 ? symbol : symbol.slice(cut + 1);
+
+  // TWO callable descriptor shapes, and missing the second one silently halved
+  // the graph. [RULE] scip-accepts-term-and-method-descriptors
+  //
+  //   `name().`  — a METHOD descriptor: `export function name() {}`
+  //   `name.`    — a TERM descriptor:   `export const name = async () => {}`
+  //
+  // TypeScript treats an arrow function assigned to a const as a VARIABLE, so
+  // SCIP emits a term. Requiring "()." therefore discarded every arrow-function
+  // export: on a real server that was 3,584 term symbols dropped against 1,624
+  // kept, so `who-calls logAudit` answered "no callers" for a function called
+  // throughout the codebase — while `verifyToken`, three lines away but written
+  // as `export function`, resolved fine.
+  //
+  // Non-callable terms (`Array.`, an imported type) are admitted here and cost
+  // nothing: a name only resolves when a CALL SITE is looking for that exact
+  // name, so a type reference never matches one.
+  //
+  // Parameters (`name().(p)`) stay excluded — they end in `)`, not `.`.
+  let m = descriptor.match(/^([A-Za-z_$][\w$]*)\(\)\.$/);   // function / method
+  if (!m) m = descriptor.match(/^([A-Za-z_$][\w$]*)\.$/);   // term (const arrow fn)
+  return m ? m[1] : null;
+}
+
+// ── Read a SCIP index into resolution maps ───────────────────────────────────
+
+const SYMBOL_ROLE_DEFINITION = 0x1; // SymbolRole.Definition bit
+
+// scip-typescript indexes whatever its tsconfig includes — which on real projects
+// often covers build output (dist-local/, dist-test/, build/). Those generated
+// bundles must NOT enter the graph (duplicate, minified symbols pollute who-calls).
+// Mirror the indexer's SKIP_DIRS prefix logic at the SCIP-doc level.
+function isBuildOutputPath(relPath) {
+  const seg = String(relPath).split('/');
+  for (const s of seg) {
+    if (s === 'node_modules' || s === '.git' || s === 'coverage') return true;
+    for (const pre of ['dist', 'build', 'out']) {
+      if (s === pre || (s.length > pre.length && s.startsWith(pre) &&
+          (s[pre.length] === '-' || s[pre.length] === '.' || s[pre.length] === '_'))) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Decode a `.scip` file and build resolution maps.
+ *
+ * `pathPrefix` re-roots every path in the index to be repo-root-relative.
+ * An indexer reports paths relative to WHERE IT RAN: indexing `server/` emits
+ * `src/index.ts`, while the graph stores `server/src/index.ts`. Without the
+ * prefix, a nested project's refs key on paths the graph has never heard of and
+ * resolve nothing — a second indexer run would LOOK like a fix and change
+ * nothing. [RULE] scip-paths-reprefixed-to-repo-root
+ *
+ * The prefix must apply to BOTH the fileRefs keys AND the funcId values, since
+ * a funcId is `relPath#name` — prefixing only the keys leaves every funcId
+ * pointing at a path the graph does not have.
+ *
+ * @param {string} scipPath  absolute path to an index.scip
+ * @param {string} [pathPrefix]  repo-relative dir the index was produced from
+ *                               (e.g. "server"); "" or "." for the repo root
+ * @returns {{ ok: true, symbolToDef: Map<string,string>,
+ *             fileRefs: Map<string, Array<{symbol:string, funcId:string, line:number}>>,
+ *             docPaths: Set<string> }
+ *         | { ok: false, reason: string }}
+ */
+function readScipIndex(scipPath, pathPrefix) {
+  // Normalize: "", ".", "./", "server/" and "server" all mean the same thing.
+  const rawPrefix = (pathPrefix || '').replace(/^\.\/+/, '').replace(/\/+$/, '');
+  const prefix = (rawPrefix === '' || rawPrefix === '.') ? '' : rawPrefix + '/';
+  const reroot = prefix ? (p) => prefix + p : (p) => p;
+  const proto = loadScipProto();
+  if (!proto) {
+    return { ok: false, reason: 'scip-decoder-unavailable' };
+  }
+  if (!fs.existsSync(scipPath)) {
+    return { ok: false, reason: 'scip-file-missing' };
+  }
+
+  let obj;
+  try {
+    const buf = fs.readFileSync(scipPath);
+    obj = proto.Index.deserialize(buf).toObject();
+  } catch (e) {
+    return { ok: false, reason: `scip-decode-failed: ${e.message}` };
+  }
+
+  const symbolToDef = new Map();          // scipSymbol → funcId (relPath#name)
+  const fileRefs = new Map();             // relPath → [{symbol, line}]
+  // Every file the indexer produced a document for — including files with no
+  // resolvable reference, which never appear in fileRefs. Without this set a
+  // file the indexer SKIPPED (scip-typescript drops files over its byte-size cap)
+  // is indistinguishable from one it indexed and found nothing in.
+  // [RULE] scip-missing-file-detected-never-silent
+  const docPaths = new Set();
+  // Every position (line, column) SCIP put ANY symbol at, per file — external,
+  // local, or repo. A call site whose callee sits at one of these was SEEN by the
+  // compiler (resolved to something, even if not a repo function); one that
+  // does not was never looked at. Numbers, not strings: a large repo has
+  // millions of occurrences. [RULE] scip-tier-proportional
+  const occurrencePositions = new Map();
+
+  const docs = obj.documents || [];
+
+  // First pass: collect every DEFINITION occurrence → symbol → funcId.
+  for (const doc of docs) {
+    const rawPath = doc.relative_path;
+    if (!rawPath || isBuildOutputPath(rawPath)) continue;
+    const relPath = reroot(rawPath);
+    docPaths.add(relPath);
+    for (const occ of doc.occurrences || []) {
+      const isDef = (occ.symbol_roles & SYMBOL_ROLE_DEFINITION) !== 0;
+      if (!isDef) continue;
+      const name = funcNameFromSymbol(occ.symbol);
+      if (!name) continue;
+      // funcId = the graph's file#name key (repo-root-relative)
+      symbolToDef.set(occ.symbol, `${relPath}#${name}`);
+    }
+  }
+
+  // Second pass: collect every REFERENCE occurrence per file, resolved to the def.
+  // A reference is kept whatever scope encloses it — named function, anonymous
+  // route handler, or top-level callback. The CALLER identity comes from the
+  // tree-sitter floor (which synthesizes one for anonymous scopes); SCIP only
+  // resolves the TARGET. [RULE] anonymous-caller-synthesized-never-dropped
+  for (const doc of docs) {
+    const rawPath = doc.relative_path;
+    if (!rawPath || isBuildOutputPath(rawPath)) continue;
+    const relPath = reroot(rawPath);
+    const refs = [];
+    const positions = new Set();
+    occurrencePositions.set(relPath, positions);
+    for (const occ of doc.occurrences || []) {
+      if (Array.isArray(occ.range) && occ.range.length >= 2) positions.add(scipPositionKey(occ.range[0], occ.range[1]));
+      const isDef = (occ.symbol_roles & SYMBOL_ROLE_DEFINITION) !== 0;
+      if (isDef) continue;                       // refs only
+      const name = funcNameFromSymbol(occ.symbol);
+      if (!name) continue;                        // only callable references
+      const funcId = symbolToDef.get(occ.symbol); // resolve to the def
+      if (!funcId) continue;                      // external/unresolvable → skip (stays floor)
+      const line = Array.isArray(occ.range) ? occ.range[0] : null;
+      refs.push({ symbol: occ.symbol, funcId, line });
+    }
+    if (refs.length) fileRefs.set(relPath, refs);
+  }
+
+  return { ok: true, symbolToDef, fileRefs, docPaths, occurrencePositions };
+}
+
+/** 0-based line + column → one number (columns never reach 1e6). */
+function scipPositionKey(line0, col) {
+  return line0 * 1e6 + col;
+}
+
+module.exports = {
+  loadScipProto,
+  funcNameFromSymbol,
+  readScipIndex,
+  scipPositionKey,
+};
