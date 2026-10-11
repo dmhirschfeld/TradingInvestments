@@ -1,9 +1,9 @@
 # GSD-T Progress
 
 ## Project: TradingInvestments
-## Version: 0.1.10
+## Version: 0.1.11
 ## Status: READY
-## Date: 2026-10-11 13:20 PDT
+## Date: 2026-10-11 13:24 PDT
 
 ## Current Milestone
 None — ready for next milestone
@@ -40,6 +40,7 @@ None — ready for next milestone
 - 2026-10-11 12:01: Merged links-table (FR1.4), no-graph-DB rule (FR1.5), Phase 1 links table and Phase 4 related-names experiment from "Requirements from Research.md" into the revised requirements doc
 - 2026-10-11 13:07: Research report reviewed — no graph-DB recommendation in its body; resolved Alpaca free-plan question (IEX-only, keep $99 plan) in requirements doc
 - 2026-10-11 13:20: Initial check-in to GitHub (v0.1.10) — onboarding scaffold, requirements docs, research report
+- 2026-10-11 13:24: Deleted stale "Requirements from Research.md" (user-approved); verified Alpaca paper supports multi-leg options (mleg) and recorded constraints in requirements doc (v0.1.11)
 
 ## Session Log
 | Date | Session | What was accomplished |

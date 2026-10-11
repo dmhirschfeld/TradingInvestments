@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented here.
 
+## [0.1.11] - 2026-10-11
+
+### Changed
+- Recorded Alpaca multi-leg options support (verified) and its order constraints in the requirements doc
+
+### Removed
+- Stale "Requirements from Research" copy; the revised requirements doc is the single source
+
 ## [0.1.10] - 2026-10-11
 
 ### Added

@@ -250,4 +250,4 @@ The production VM is in place before phase 4 starts, so no daily run is missed.
 **To verify with providers before building on them**
 
 - [x] Whether Alpaca's free market-data plan covers daily bars — no: Basic is IEX-only (research report §3), which understates volume for the liquidity filters, so keep the $99 plan
-- [ ] Whether Alpaca paper supports multi-leg option orders (needed for phase 5 spreads)
+- [x] Whether Alpaca paper supports multi-leg option orders (needed for phase 5 spreads) — yes: Level 3 multi-leg (order class `mleg`) covers spreads, straddles, strangles, iron condors and butterflies in paper, and live as well ([changelog](https://docs.alpaca.markets/us/changelog/multi-leg-level-3-options-trading-in-paper), [guide](https://docs.alpaca.markets/us/docs/options-level-3-trading), checked 2026-10-11). Limits for the adapter: no stock legs in the same order, every short leg must be covered within the order, leg ratios in simplest form; the guide's examples use only limit, day orders.
