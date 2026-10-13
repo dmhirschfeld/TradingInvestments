@@ -1,12 +1,12 @@
 # GSD-T Progress
 
 ## Project: TradingInvestments
-## Version: 0.1.11
-## Status: READY
-## Date: 2026-10-11 13:24 PDT
+## Version: 0.2.10
+## Status: IN PROGRESS
+## Date: 2026-10-12 18:22 PDT
 
 ## Current Milestone
-None — ready for next milestone
+Phase 1 Foundations — branch phase1-foundations. Done: schema, ledger, cost model, basic risk gate, momentum, variants, Alpaca adapter, reconciliation, restartable run (13 tests). Next: FMP/FRED/theme data adapters, pivotal-event logger, cron entry, Alpaca keys and live reconcile gate.
 
 ## Completed Milestones
 | Milestone | Version | Completed | Tag |
@@ -41,6 +41,12 @@ None — ready for next milestone
 - 2026-10-11 13:07: Research report reviewed — no graph-DB recommendation in its body; resolved Alpaca free-plan question (IEX-only, keep $99 plan) in requirements doc
 - 2026-10-11 13:20: Initial check-in to GitHub (v0.1.10) — onboarding scaffold, requirements docs, research report
 - 2026-10-11 13:24: Deleted stale "Requirements from Research.md" (user-approved); verified Alpaca paper supports multi-leg options (mleg) and recorded constraints in requirements doc (v0.1.11)
+- 2026-10-12 18:03: Architect pass on system design — added slow themes layer, pivotal-event path, multi-portfolio variant testing (Claude places paper orders), technical indicators, full-universe + theme data from Phase 1; data sources researched; plan in .gsd-t/pseudocode/PseudoCode-TradingSystemDesign.md awaiting approval
+- 2026-10-12 18:08: Paper phase switched to low-cost data (~$49/mo): Alpaca free plan, FMP lower tier for end-of-day prices, SerpApi free tier, Wikipedia page views; Alpaca $99 and Quiver deferred until proven needed
+- 2026-10-12 18:11: Claude via Max subscription (claude -p, personal use, no API key in job env, HALT on limit); $5,000 starting cash per portfolio; Alpaca mirrors momentum + Claude formula-sized + Claude self-sized
+- 2026-10-12 18:12: Every pipeline runs at two sizes ($5,000 and $100,000), compared in percent; Alpaca mirrors come from the $5,000 set; Max-plan checks dropped at user direction
+- 2026-10-12 18:22: Built Phase 1 foundations on branch phase1-foundations (v0.2.10): requirements doc revised to the approved plan; Postgres schema, ledger, cost model, basic risk gate, momentum, 22 portfolio definitions, Alpaca paper adapter, reconciliation, restartable evening run; 13 tests pass; local DBs trading / trading_test recorded in Environments
+- 2026-10-13 10:23: Committed Phase 1 foundations on phase1-foundations and pushed the branch; 13/13 tests pass; merge to main pending
 
 ## Session Log
 | Date | Session | What was accomplished |

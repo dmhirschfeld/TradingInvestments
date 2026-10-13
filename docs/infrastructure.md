@@ -81,6 +81,7 @@ cp .env.example .env
 
 | id | scope | kind | host | port | db/name | auth method | secret vault | secret env-var NAME | fetch command | connect command | access gotchas | read-only default | recorded | source |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| local-postgres | local | postgres | localhost | 5432 | trading | trust | local (.env) | TRADING_DATABASE_URL | cat .env | psql "$TRADING_DATABASE_URL" | none | NO | 2026-10-13T01:19:35.438Z | — |
 <!-- gsd-t-env-registry:end -->
 
 <!--
