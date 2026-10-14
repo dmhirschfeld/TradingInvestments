@@ -50,6 +50,7 @@ Phase 1 Foundations — on main. Done: schema, ledger, cost model, basic risk ga
 - 2026-10-13 16:42: Committed "CLAUDE.md updates.md" — hook-generated change log for CLAUDE.md
 - 2026-10-13 17:07: Branch phase1-data-feeds (v0.2.11): Alpaca paper accounts 1 and 2 verified; fractional day limit orders confirmed, $1 order minimum found and enforced for all portfolios; Alpaca free plan news feed confirmed and collected into news_items; `trading` CLI (migrate, check-brokers, ingest-news); real `trading` DB migrated, 22 portfolios seeded; 17/17 tests pass. FMP/FRED keys and Alpaca account 3 still pending
 - 2026-10-13 17:17: Merged phase1-foundations and phase1-data-feeds into main at user direction; development continues on main (single developer)
+- 2026-10-13 17:40: Restored accidentally deleted .env.example in the main checkout; removed stray Hilo Aviation deck and empty tsconfig.json (untracked, never committed); folded 3 older entries into "CLAUDE.md updates.md"
 
 ## Session Log
 | Date | Session | What was accomplished |
