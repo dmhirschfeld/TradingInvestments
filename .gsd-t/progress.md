@@ -47,6 +47,7 @@ Phase 1 Foundations — branch phase1-foundations. Done: schema, ledger, cost mo
 - 2026-10-12 18:12: Every pipeline runs at two sizes ($5,000 and $100,000), compared in percent; Alpaca mirrors come from the $5,000 set; Max-plan checks dropped at user direction
 - 2026-10-12 18:22: Built Phase 1 foundations on branch phase1-foundations (v0.2.10): requirements doc revised to the approved plan; Postgres schema, ledger, cost model, basic risk gate, momentum, 22 portfolio definitions, Alpaca paper adapter, reconciliation, restartable evening run; 13 tests pass; local DBs trading / trading_test recorded in Environments
 - 2026-10-13 10:23: Committed Phase 1 foundations on phase1-foundations and pushed the branch; 13/13 tests pass; merge to main pending
+- 2026-10-13 17:39: Restored accidentally deleted .env.example; removed stray Hilo Aviation deck and empty tsconfig.json (untracked, never committed); merged phase1-foundations to main; 13/13 tests pass
 
 ## Session Log
 | Date | Session | What was accomplished |
