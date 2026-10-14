@@ -1,7 +1,7 @@
 # GSD-T Progress
 
 ## Project: TradingInvestments
-## Version: 0.2.10
+## Version: 0.2.11
 ## Status: IN PROGRESS
 ## Date: 2026-10-12 18:22 PDT
 
@@ -47,6 +47,7 @@ Phase 1 Foundations — branch phase1-foundations. Done: schema, ledger, cost mo
 - 2026-10-12 18:12: Every pipeline runs at two sizes ($5,000 and $100,000), compared in percent; Alpaca mirrors come from the $5,000 set; Max-plan checks dropped at user direction
 - 2026-10-12 18:22: Built Phase 1 foundations on branch phase1-foundations (v0.2.10): requirements doc revised to the approved plan; Postgres schema, ledger, cost model, basic risk gate, momentum, 22 portfolio definitions, Alpaca paper adapter, reconciliation, restartable evening run; 13 tests pass; local DBs trading / trading_test recorded in Environments
 - 2026-10-13 10:23: Committed Phase 1 foundations on phase1-foundations and pushed the branch; 13/13 tests pass; merge to main pending
+- 2026-10-13 17:07: Branch phase1-data-feeds (v0.2.11): Alpaca paper accounts 1 and 2 verified; fractional day limit orders confirmed, $1 order minimum found and enforced for all portfolios; Alpaca free plan news feed confirmed and collected into news_items; `trading` CLI (migrate, check-brokers, ingest-news); real `trading` DB migrated, 22 portfolios seeded; 17/17 tests pass. FMP/FRED keys and Alpaca account 3 still pending
 
 ## Session Log
 | Date | Session | What was accomplished |

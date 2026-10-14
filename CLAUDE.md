@@ -22,7 +22,8 @@ Python 3.12 with uv, Postgres 17 (local Homebrew), psycopg, httpx, pytest.
 |---|---|
 | Install | `uv sync` |
 | Test | `uv run pytest` (needs local database `trading_test`) |
-| Migrate | `uv run python -c "from trading import db; db.migrate(db.connect())"` with `TRADING_DATABASE_URL` set |
+| Migrate | `uv run --env-file .env trading migrate` |
+| Other commands | `trading check-brokers`, `trading ingest-news` (same `uv run --env-file .env` prefix) |
 | Expected branch | `main` |
 
 ## Logging

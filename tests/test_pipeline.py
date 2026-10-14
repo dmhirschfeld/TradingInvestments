@@ -117,3 +117,24 @@ def test_bad_data_blocks_trading(conn, world, tmp_path):
         pipeline.run_daily(conn, day1, _known(day1), FixtureSource(path),
                            {"alpaca_paper_1": FakeBroker()})
     assert conn.execute("SELECT count(*) FROM orders").fetchone()[0] == 0
+
+
+def test_orders_under_one_dollar_are_skipped(conn, world):
+    """Alpaca rejects orders under $1, so no portfolio places one (MIN_ORDER_VALUE)."""
+    source, day1 = world
+    pid = _pid(conn, "momentum_100000")
+    price = Decimal(str(round(50 * STOCKS["S09"] ** HISTORY, 4)))
+    target = (Decimal("100000") * pipeline.CASH_BUFFER / pipeline.MOMENTUM_PICKS / price) \
+        .quantize(Decimal("0.000001"))
+    oid = conn.execute(
+        "INSERT INTO orders (portfolio_id, client_order_id, run_day, symbol, side, qty, limit_price,"
+        " status) VALUES (%s, 'earlier-S09', %s, 'S09', 'buy', %s, %s, 'filled') RETURNING id",
+        (pid, day1 - timedelta(days=40), target - Decimal("0.001"), price)).fetchone()[0]
+    ledger.record_fill(conn, oid, target - Decimal("0.001"), price, Decimal(0), "ledger")
+
+    pipeline.run_daily(conn, day1, _known(day1), source, {"alpaca_paper_1": FakeBroker()})
+
+    today = {r[0] for r in conn.execute(
+        "SELECT symbol FROM orders WHERE portfolio_id = %s AND run_day = %s", (pid, day1))}
+    assert "S09" not in today                      # 0.001 share short of target is worth < $1
+    assert today == {f"S{i:02d}" for i in range(2, 9)}

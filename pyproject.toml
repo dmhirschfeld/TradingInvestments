@@ -11,6 +11,9 @@ dependencies = [
     "psycopg[binary]>=3.2",
 ]
 
+[project.scripts]
+trading = "trading.cli:main"
+
 [build-system]
 requires = ["uv_build>=0.11.26,<0.12.0"]
 build-backend = "uv_build"

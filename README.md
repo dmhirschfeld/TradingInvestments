@@ -6,6 +6,9 @@ Paper-trading system that runs Claude-driven and rule-based pipelines side by si
 uv sync
 createdb trading && createdb trading_test
 uv run pytest
+uv run --env-file .env trading migrate        # apply migrations, create portfolios
+uv run --env-file .env trading check-brokers  # read-only check of mirrored Alpaca accounts
+uv run --env-file .env trading ingest-news    # pull new news stories
 ```
 
 Copy `.env.example` to `.env` and fill in values as accounts are created.

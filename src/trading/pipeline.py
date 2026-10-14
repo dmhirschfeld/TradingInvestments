@@ -17,6 +17,7 @@ PHASE = 1
 MOMENTUM_PICKS = 8
 LIMIT_BAND = Decimal("0.005")       # FR8.4: limit = prior close +/- 0.5%
 CASH_BUFFER = Decimal("0.99")       # keep 1% back for costs
+MIN_ORDER_VALUE = Decimal("1")      # Alpaca rejects orders under $1; every portfolio follows the same rule
 HOLD_SYMBOL = {"spy_hold": "SPY", "iwm_hold": "IWM"}
 
 
@@ -157,7 +158,7 @@ def _decide(conn, day: date, known_at: datetime, limits: risk.RiskLimits) -> int
         targets = _targets(conn, pipeline, day, known_at, equity, prices)
         for sym in sorted(set(targets) | set(held)):
             delta = targets.get(sym, Decimal(0)) - held.get(sym, Decimal(0))
-            if delta == 0:
+            if abs(delta) * prices[sym] < MIN_ORDER_VALUE:
                 continue
             side = BUY if delta > 0 else SELL
             band = 1 + LIMIT_BAND if side == BUY else 1 - LIMIT_BAND

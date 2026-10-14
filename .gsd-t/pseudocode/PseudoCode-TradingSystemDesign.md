@@ -202,8 +202,8 @@ At $5,000:
 ## Open questions
 
 - Financial Modeling Prep lower tier: confirm it includes whole-market end-of-day prices and delisted history before paying.
-- Alpaca free plan: confirm it includes the live news stream.
-- Whether Alpaca accepts limit orders for fractional shares.
+- ~~Alpaca free plan: confirm it includes the live news stream.~~ Confirmed 2026-10-13.
+- ~~Whether Alpaca accepts limit orders for fractional shares.~~ Yes, day limit orders; orders under $1 are rejected (confirmed 2026-10-13).
 - Polymarket read access from the US: confirm it is allowed, else Kalshi only.
 - Alpaca news covers Benzinga staff stories only; if it misses world events, add Finnhub's general news.
 - Candle-pattern evidence is unproven; it is tested as its own portfolio rather than trusted.

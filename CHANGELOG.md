@@ -2,6 +2,17 @@
 
 All notable changes to this project are documented here.
 
+## [0.2.11] - 2026-10-13
+
+### Added
+- News collection from Alpaca's free Benzinga feed: `news_items` table (migration 002), raw page saved first, paging followed, reruns add nothing
+- `trading` command: `migrate`, `check-brokers` (read-only Alpaca check), `ingest-news`
+- Tests: 17 passing (news paging/raw-first/idempotency, edited stories, missing keys, sub-$1 orders)
+
+### Changed
+- Orders worth under $1 are skipped for every portfolio (Alpaca's minimum, verified on paper)
+- Verified on paper: fractional day limit orders accepted; free plan includes the news feed
+
 ## [0.2.10] - 2026-10-12
 
 ### Added
